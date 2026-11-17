@@ -32,7 +32,7 @@ cd ~/vs-labs-linux
 4. It downloads MSVC, the Windows SDK, MSBuild and the C++ MSBuild targets straight from Microsoft to your disk.
    This repository contains no Microsoft binary and never redistributes one.
 
-Options: `--root DIR` (where everything lives), `--msvc-version 14.50`, `--no-msbuild`, `--userspace`, `--no-msvc`.
+Options: `--root DIR` (where everything lives), `--msvc-version 14.52` (also fetches that toolset next to an older one, after your yes), `--no-msbuild`, `--userspace`, `--no-msvc`.
 Check with `vslab doctor`.
 
 ## Everyday use
@@ -95,9 +95,14 @@ A same-input comparison with a clean Visual Studio build of the same lab (Debug 
 byte-identical to the PC's; `.text` and the other code and data sections of every `.obj` are identical; the `.exe` has the same section layout and size.
 What differs is only: build timestamps, the PDB GUID (new on every build, even between two Linux builds), and the effect of the compiler build number: the Rich
 header, CodeView type indices that are shifted by 4 between the compiler builds (so about 70 percent of per-function `.debug$S` sections and their `.chks64` checksums differ
-in `Main.obj`), and a few import hints from the SDK libraries (a different refresh). Microsoft's installer channel hands out the newest servicing build (compiler 19.51.36263) while a given Windows machine may
-have an older one (the reference PC has VS 18.10.0: 19.51.36257). Matching needs the same servicing build on both sides; `vsdownload` accepts an older channel manifest with `--manifest`
-if you have one. `install.sh` does not run msvc-wine's fix-up step (it lower-cases `#include` text and converts line ends in Microsoft's headers); older installs can run
+in `Main.obj`), and a few import hints from the SDK libraries (a different refresh). That measurement was made against VS 18.10 (toolset 14.51.36231, compiler 19.51.36257) with
+14.51 on Linux.
+
+Which toolset matches: **Visual Studio 18.12 builds with toolset 14.52.37025** (compiler 19.52.37029, confirmed by a real MSBuild run:
+`VCToolsVersion=14.52.37025` in `.lastbuildstate`). `vslab` therefore prefers a 14.52 toolset and falls back to the newest complete one with a
+warning (`VSLAB_MSVC=14.51` selects the older toolset on purpose). When the 14.52 toolset is used, the records also follow the 18.12 MSBuild: the object files in `CL.write`
+carry a `\\?\` prefix (`VSLAB_VS=18.10` or `18.12` overrides that guess). Get the toolset with `install.sh --msvc-version 14.52`.
+A 14.52 download that only contains headers/lib stubs (as the first reinstall produced) is not enough; the compiler package must be there. `install.sh` does not run msvc-wine's fix-up step (it lower-cases `#include` text and converts line ends in Microsoft's headers); older installs can run
 `vslab repair-headers` for the CRLF part, but a reinstall is the only complete fix.
 
 ## MSBuild (optional, experimental)

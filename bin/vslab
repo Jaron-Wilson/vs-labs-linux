@@ -270,8 +270,11 @@ class Toolchain:
         if not (self.msvc / "VC/Tools/MSVC").is_dir():
             sys.exit(f"vslab: MSVC is not installed in {self.msvc}. Run install.sh (it shows Microsoft's license and asks for your yes).")
         vers = sorted(p.name for p in (self.msvc / "VC/Tools/MSVC").iterdir() if (p / "bin").is_dir())
-        want = os.environ.get("VSLAB_MSVC", "14.51")  # his PC builds with 14.51.36231
+        want = os.environ.get("VSLAB_MSVC", "14.52")  # VS 18.12 builds with 14.52.37025; VSLAB_MSVC=14.51 selects the older toolset
         pick = [v for v in vers if v.startswith(want)]
+        if not pick and "VSLAB_MSVC" not in os.environ:
+            print(f"vslab: toolset {want} (the one VS 18.12 uses) is not installed; using {vers[-1]}. "
+                  f"For an exact match run: install.sh --msvc-version {want}", file=sys.stderr)
         self.vcver = pick[-1] if pick else vers[-1]
         kits = self.msvc / "Windows Kits/10"
         self.sdkver = sorted(p.name for p in (kits / "Include").iterdir() if p.name[0].isdigit())[-1]
@@ -322,6 +325,15 @@ class Toolchain:
             except OSError:
                 pass
         return out
+
+    @property
+    def vs18_12(self):
+        """True when the records should follow Visual Studio 18.12 (toolset 14.52): its MSBuild writes the object files in CL.write
+        with a backslash-backslash-question-mark prefix. VSLAB_VS=18.10 or 18.12 overrides the guess from the toolset."""
+        v = os.environ.get("VSLAB_VS")
+        if v:
+            return tuple(int(x) for x in v.split(".")[:2]) >= (18, 12)
+        return tuple(int(x) for x in self.vcver.split(".")[:2]) >= (14, 52)
 
     @property
     def vc_win(self):
@@ -542,7 +554,7 @@ def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, 
     read = "".join(f"^{up(s)}\n" + "\n".join(deps(i, s)) + "\n" for i, s in enumerate(abs_srcs))
     u16(tl / "CL.read.1.tlog", read)
     wr = "^" + "|".join(up(s) for s in abs_srcs) + "\n" + up(rf"{wproj}\{CFG.rel}\vc145.pdb") + "\n" + (up(rf"{wproj}\{CFG.rel}\vc145.idb") + "\n" if CFG.dbg else "") + \
-         "\n".join(up(rf"{wproj}\{CFG.rel}\{Path(s).stem}.obj") for s in reversed(srcs)) + "\n"
+         "\n".join(("\\\\?\\" if tc.vs18_12 else "") + up(rf"{wproj}\{CFG.rel}\{Path(s).stem}.obj") for s in reversed(srcs)) + "\n"
     wr += "".join(f"^{up(s)}\n" + up(rf"{wproj}\{CFG.rel}\vc145.pdb") + "\n" for s in abs_srcs)
     u16(tl / "CL.write.1.tlog", wr)
     (tl / "Cl.items.tlog").write_bytes("".join(f"{a};{wproj}\\{CFG.rel}\\{PureWindowsPath(r).stem}.obj\r\n" for a, r in zip(abs_srcs, srcs)).encode())

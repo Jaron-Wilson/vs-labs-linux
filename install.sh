@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vs-labs-linux installer (Ubuntu 24.04 first; Fedora notes in README are untested).
 #
-#   ./install.sh [--root DIR] [--msvc-version 14.50] [--sdk-version 10.0.26100] [--no-msbuild]
+#   ./install.sh [--root DIR] [--msvc-version 14.52] [--sdk-version 10.0.26100] [--no-msbuild]
 #                [--userspace] [--no-msvc]
 #
 # What it does
@@ -120,7 +120,16 @@ Z=$(find "$ROOT/root" -name zlib1.dll -path '*x86_64-windows*' 2>/dev/null | hea
 [ -n "$Z" ] && [ -d "$ROOT/wineprefix/drive_c/windows/system32" ] && cp -n "$Z" "$ROOT/wineprefix/drive_c/windows/system32/" || true
 
 # ---------------------------------------------------------------- 3. license
+have_toolset=no
 if [ -d "$ROOT/msvc/VC/Tools/MSVC" ]; then
+  have_toolset=yes
+  # --msvc-version 14.52 on an install that only has an older toolset: fetch the wanted one next to it (needs your yes again)
+  if [ -n "$MSVC_VERSION" ]; then
+    have_toolset=no
+    for d in "$ROOT/msvc/VC/Tools/MSVC/$MSVC_VERSION"*; do [ -d "$d/bin" ] && have_toolset=yes; done
+  fi
+fi
+if [ "$have_toolset" = yes ]; then
   echo "MSVC already installed in $ROOT/msvc"
 else
   say "Microsoft license"

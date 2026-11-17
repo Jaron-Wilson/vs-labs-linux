@@ -51,3 +51,33 @@ summary: 51 identical, 29 same-format, 0 different-format, 0 missing, 0 extra (o
 
 Known remaining gaps: exact servicing build of the compiler and SDK libraries (the installer channel serves the newest one), the memory image of `.ipch`, rows of Microsoft header symbols in
 `Browse.VC.db` without a seed, the IDE's own state in `.suo`. MSBuild itself does not run (no .NET in Wine). The real IntelliSense engine route was investigated and is a dead end for now (see `intellisense-engine.md`).
+
+## Round 4: after the PC moved to Visual Studio 18.12 (2026-11-17)
+
+The PC now reports VS 18.12.0. Its C++ toolset folders are 14.44.35207 and 14.52.37025 (compiler 19.52.37029); 14.51 is gone.
+A clean MSBuild of a scratch copy of the lab on the PC (all four configurations) shows `VCToolsVersion=14.52.37025`,
+`VCServicingVersion{ATL,CrtHeaders,Compilers}=14.52.37029`, SDK 10.0.26100.0, and every `CL.read` path under `...\MSVC\14.52.37025\`.
+So VS 18.12 builds with 14.52, not 14.51.
+
+The server has the full 14.51.36231 toolset only. Its `14.52.37025` folder is a stub (crt, lib and Auxiliary, 348 KB, no `bin` and no `include`), so there is no 14.52 compiler to
+run yet. Getting it needs the Microsoft license step, which only the owner runs: `install.sh --msvc-version 14.52` (it asks for the yes again). Because of that, the exe/obj/pdb byte comparison with the same compiler on both sides was NOT redone.
+Same-input comparison against the new PC build using the 14.51 toolset (tlog paths normalised from 14.51 to 14.52 for the comparison only):
+
+| Configuration | tlog files identical (of 9) | Differences |
+| --- | --- | --- |
+| Debug x64 | 7 | `CL.read` (position of `<cctype>`/`ctype.h` in the include order, a 14.52 header change), `.lastbuildstate` (toolset and servicing numbers) |
+| Release x64 | 7 | same |
+| Debug x86 | 7 | same |
+| Release x86 | 6 | same, plus `link.read`: see below |
+
+New in 18.12 and now reproduced: `CL.write` lists the `.obj` files with a `\\?\` prefix (18.10 did not). vslab emits it when the 14.52 toolset (or `VSLAB_VS=18.12`) is selected; verified, `CL.write` is then identical.
+The `link.read` difference on Release x86 is build session state, not a format change: the first link after no `mspdbsrv.exe` is running records it, later ones in the same session do not (measured twice on the PC: 1 line, then 0).
+The vslab output corresponds to the fresh start, which is what a first build in a new session produces.
+
+`.exe` sizes, PC 14.52 vs Linux 14.51 (different compilers, so only a sanity check): Debug x64 1,276,416 vs 1,161,728; Release x64 125,952 vs 136,192; Debug x86 927,744 vs 858,112; Release x86 125,952 vs 125,440.
+
+`vslab check` of the Linux zip against the real reference zip (made by VS 18.10) is unchanged: 51 identical, 29 same-format, 0 different-format, 0 missing, 0 extra (80 reference files).
+That reference was written by 18.10, so its tlogs correctly keep the 18.10 style (no `\\?\`); vslab with the default 14.51 fallback reproduces it. Note that the 15 IDE `*.dt.*` files and four `.ipch` files appear
+only when the same files are open as in the reference (`vslab tabs open Date.cpp Date.h Employee.cpp Visit.cpp`); with only the default tab the check reports them missing.
+
+Still to do after the 14.52 toolset is installed: re-run the PC against Linux comparison of `.exe`, `.obj`, `.pdb`, `.ilk` and the tlogs (expect `.lastbuildstate` and `CL.read` to match, and the `.obj` code and debug sections to match).
