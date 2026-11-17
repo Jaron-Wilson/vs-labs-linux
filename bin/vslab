@@ -579,14 +579,10 @@ def refresh_cache(lab, only=None):
     g = load_gen("vsidx")
     dest = vdir / f"{vid}.vsidx"
     (g.generate(lab, dest) if g else dest.write_bytes(b""))
-    # ipch/AutoPCH/<hash>/<SOURCE>.ipch : one per source file (names right, content empty unless a generator exists)
+    # ipch/AutoPCH/<hash>/<SOURCE>.ipch for the files open in the editor (VS makes one per parsed .cpp)
     g = load_gen("ipch")
-    for s in lab.sources():
-        h = hashlib.sha1((lab.win_proj + "\\" + s).lower().encode()).hexdigest()[:16].lstrip("0") or "0"
-        d = v18 / "ipch/AutoPCH" / h
-        d.mkdir(parents=True, exist_ok=True)
-        dest = d / (Path(s).stem.upper() + ".ipch")
-        (g.generate(lab, dest) if g else dest.write_bytes(b""))
+    if g:
+        g.generate_all(lab, str(v18 / "ipch/AutoPCH"), sources_for_layout(lab))
     say("editor cache written to", vs.relative_to(lab.sol_dir))
 
 
