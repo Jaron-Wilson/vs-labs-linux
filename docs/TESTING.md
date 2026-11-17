@@ -11,19 +11,38 @@ folder = project folder, stdout redirected to a file: 4942 bytes (Windows) vs 49
 bytes (0x0c): the program calls `cls`, which Windows writes as a form feed into a redirected stream and Wine's cmd does not. On a terminal
 both clear the screen.
 
-## `vslab check` against the real zip (83 MB, 99 entries), all generators on
+## `vslab check` against the real zip (83 MB, 99 entries), all generators on, round 2 (2026-11-17)
 
-summary: 35 identical, 25 same-format, 0 different-format, 23 missing, 1 extra (of 83 reference files). Zip metadata identical.
+summary: 51 identical, 29 same-format, 0 different-format, 0 missing, 0 extra (of 80 reference files). Zip metadata identical.
+The file set is now complete: every file, including the 15 IDE scan files and all four `.ipch`, exists in the Linux made zip.
 
 | Result | Count | Files |
 | --- | --- | --- |
-| Identical (byte for byte) | 35 | sources and data files, `.slnx`, `.vcxproj`, `.filters`, `.user`, `<project>.log`, `.exe.recipe`, `link.command`, `link.write`, `Cl.items`, `link.secondary` tlogs, `.dt.*` is not among them (see missing) |
-| Same format, different bytes | 25 | `.suo` (valid OLE file, 33,792 vs 40,448 B), `Browse.VC.db` (same schema, project symbols from libclang, 22,806,528 vs 22,773,760 B), `Solution.VC.db` (same size, differs only in content that depends on paths and WAL state), both DocumentLayout files (we list every .cpp as open, the real one 3 tabs), `MAIN.ipch` (same size, exact head), 9 `.obj`, `.exe` (1,161,728 vs 1,162,240 B), 2 `.pdb`, `.ilk`, `vc145.pdb`, `vc145.idb`, `CL.command` (same size), `CL.read`, `CL.write`, `link.read`, `.lastbuildstate` (compiler servicing number 36263 here, 36257 on the PC) |
+| Identical (byte for byte) | 51 | sources and data, `.slnx`, `.vcxproj`, `.filters`, `.user`, `<project>.log`, `.exe.recipe`, `link.command`, `link.write`, `link.secondary`, `Cl.items` tlogs, all 15 `*.dt.*` scan files |
+| Same format, different bytes | 29 | `.exe`, 9 `.obj`, 2 `.pdb`, `.ilk`, `vc145.pdb`, `vc145.idb` (toolchain revision, timestamps, GUIDs), `CL.command`, `CL.read`, `CL.write`, `link.read` tlogs (the reference's tlogs record five incremental compile passes; a clean build has one), `.lastbuildstate` (compiler servicing 36263 vs 36257), `.suo` (valid OLE file, 22,016 vs 40,448 B), both DocumentLayout files (same size, same structure, different `WhenOpened` times and view state), `Browse.VC.db` (same schema, project symbols from libclang), `Solution.VC.db` (same size), 4 `.ipch` (same sizes, exact head, memory image is zeros), the `.vsidx` (random GUID name, same size) |
 | Different format | 0 | |
-| Missing | 23 | 3 `.ipch` (only files open in the editor get one), 15 IDE IntelliSense scan files `*.dt.*` (not build output, not generated), `.vsidx` name (random GUID, ours differs), `WilsonJaronLab.docx` (the student's own document) and 3 empty folders |
-| Extra | 1 | the `.vsidx` under its own random GUID |
+| Missing / Extra | 0 / 0 | |
 
-Browse.VC.db needs a "seed" (a Browse.VC.db written by a real Visual Studio, `vslab seed REAL.zip`) for the rows of Microsoft's own headers; without it the
-file has the exact schema but no rows. Headers that are not in the seed get no rows (`<map>` was missing in one test).
-Known gaps: the incremental history of the reference build (its tlogs record five compile passes) cannot be reproduced by a clean build;
-MSBuild itself does not run (needs .NET in the Wine prefix).
+## Clean build comparison with the real Visual Studio MSBuild (same lab, same Windows path)
+
+The reference zip's tlogs reflect a lab that was built many times, so a second reference was made: a copy of the lab built once, from scratch,
+on the PC with the real Visual Studio 18 MSBuild (`winpc build`, also `MSBuild /p:Platform=x86` and Release), and the same copy built on Linux with
+`VSLAB_WINREPOS` set to the same Windows folder so that every path in the files is the same.
+
+| Configuration | tlog files identical | Only difference |
+| --- | --- | --- |
+| Debug x64 | 8 of 9 | `.lastbuildstate` (compiler servicing number) |
+| Release x64 | 8 of 9 | same |
+| Debug Win32 | 8 of 9 | same |
+| Release Win32 | 8 of 9 | same |
+
+`.exe` Debug x64: identical section table and size; 432 differing bytes, all in the DOS/Rich header (compiler build number), the build
+timestamp and PDB GUID/path, and 11 import hint bytes (the SDK import libraries of the two installs are different refreshes: `kernel32.lib` has
+the same size but a different hash). `.obj`: same size, 70 differing bytes in `Aide.obj` (timestamp, `.debug$T` signature, compiler stamp, checksums of one
+header); `Main.obj` differs in `.chks64` too because the SDK headers of the Linux install were rewritten by msvc-wine's fix-up step (see README, "Toolchain
+revision"). Every other MSVC header read by the lab matches the PC's byte for byte once CRLF line ends are restored (`vslab repair-headers`, 104 of 105
+checked files; the other, `sal.h`, had one lower-cased `#include`).
+
+Known remaining gaps: exact servicing build of the compiler and SDK (the installer channel serves the newest one), the lower-cased `#include` lines in an
+install made before `install.sh` stopped running the fix-up step, the memory image of `.ipch`, rows of Microsoft header symbols in `Browse.VC.db` without a
+seed, the IDE's own state in `.suo`. MSBuild itself does not run (no .NET in Wine).

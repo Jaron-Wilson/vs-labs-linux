@@ -1096,6 +1096,18 @@ def cmd_check(a):
     for k in sorted(cmap):
         if k not in rmap and not cmap[k].endswith("/"):
             extra.append(cmap[k])
+    # files Visual Studio names with a random GUID (.vsidx): pair them by folder and extension and compare as the same kind of file
+    for (mr, mk) in list(missing):
+        if mk != "file" or not mr.endswith(".vsidx"):
+            continue
+        d = mr.rsplit("/", 1)[0]
+        mate = next((e for e in extra if e.endswith(".vsidx") and e.rsplit("/", 1)[0] == d), None)
+        if mate:
+            missing.remove((mr, mk))
+            extra.remove(mate)
+            rb, cb = rf[mr](), cf[mate]()
+            note = "random GUID name differs, as in Visual Studio"
+            (same if fmt_family(mr, rb) == fmt_family(mate, cb) else diff).append((mr, fmt_family(mr, rb), note, len(rb), len(cb)))
     print(f"reference: {a.ref}  ({len(rf)} entries)\ncandidate: {a.cand}  ({len(cf)} entries)\n")
     print(f"IDENTICAL ({len(ident)}): byte for byte equal")
     for r in ident:
