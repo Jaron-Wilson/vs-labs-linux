@@ -90,7 +90,8 @@ class Lab:
     def sources(self):
         return [m.replace("/", "\\") for m in re.findall(r'<ClCompile Include="([^"]+)"', self.vcx)]
 
-    def itemdef(self, tool, cfg="Debug|x64"):
+    def itemdef(self, tool, cfg=None):
+        cfg = cfg or CFG.key
         """metadata of <ItemDefinitionGroup Condition=cfg><tool>...</tool> as dict"""
         for g in re.finditer(r"<ItemDefinitionGroup Condition=\"([^\"]*)\">(.*?)</ItemDefinitionGroup>", self.vcx, re.S):
             if cfg in g.group(1):
@@ -99,11 +100,30 @@ class Lab:
                     return dict(re.findall(r"<(\w+)>(.*?)</\1>", t.group(1), re.S))
         return {}
 
-    def prop(self, name, cfg="Debug|x64"):
+    def prop(self, name, cfg=None):
+        cfg = cfg or CFG.key
         for g in re.finditer(r"<PropertyGroup Condition=\"([^\"]*)\" Label=\"Configuration\">(.*?)</PropertyGroup>", self.vcx, re.S):
             if cfg in g.group(1):
                 m = re.search(rf"<{name}>(.*?)</{name}>", g.group(2))
                 return m.group(1) if m else None
+
+
+class Cfg:
+    """build configuration: Debug|Release x x64|x86 (Visual Studio calls x86 'Win32' inside projects)"""
+    def __init__(self, config="Debug", plat="x64"):
+        self.config = config.capitalize()
+        self.plat = "x64" if plat.lower() == "x64" else "x86"
+        self.key = f"{self.config}|{'x64' if self.plat == 'x64' else 'Win32'}"
+        self.rel = ("x64\\" if self.plat == "x64" else "") + self.config      # folder under the project/solution folder
+        self.dbg = self.config == "Debug"
+        self.x86 = self.plat == "x86"
+
+    @property
+    def rel_unix(self):
+        return self.rel.replace("\\", "/")
+
+
+CFG = Cfg()
 
 
 def say(*a):
@@ -315,7 +335,8 @@ class Toolchain:
         e = dict(self.env)
         sdk, v = self.sdk_win, self.sdkver
         e["INCLUDE"] = ";".join([rf"{self.vc_win}\include"] + [rf"{sdk}\Include\{v}\{x}" for x in ("ucrt", "shared", "um", "winrt", "cppwinrt")])
-        e["LIB"] = ";".join([rf"{self.vc_win}\lib\x64", rf"{sdk}\Lib\{v}\ucrt\x64", rf"{sdk}\Lib\{v}\um\x64"])
+        pl = CFG.plat
+        e["LIB"] = ";".join([rf"{self.vc_win}\lib\{pl}", rf"{sdk}\Lib\{v}\ucrt\{pl}", rf"{sdk}\Lib\{v}\um\{pl}"])
         e["VSLAB_DUMMY"] = "1"
         return e
 
@@ -336,9 +357,9 @@ class Toolchain:
 
 # --------------------------------------------------------------------------- build
 def cl_flags(lab):
-    """Debug|x64 cl switches, in the order MSBuild/VS 18 (toolset v145) writes them to CL.command.1.tlog."""
+    """cl switches in the order MSBuild/VS 18 (toolset v145) writes them to CL.command.1.tlog, for the selected configuration."""
     d = lab.itemdef("ClCompile")
-    dbg = lab.prop("UseDebugLibraries") == "true"
+    dbg, x86 = CFG.dbg, CFG.x86
     f = ["/c"]
     f += ["/ZI", "/JMC"] if dbg else ["/Zi"]
     f += ["/nologo"]
@@ -347,7 +368,11 @@ def cl_flags(lab):
     f += ["/WX-", "/diagnostics:column"]
     if d.get("SDLCheck") == "true":
         f += ["/sdl"]
-    f += ["/Od"] if dbg else ["/O2", "/Oi", "/GL", "/Gy"]
+    f += ["/Od"] if dbg else ["/O2", "/Oi"]
+    if x86:
+        f += ["/Oy-"]
+    if not dbg:
+        f += ["/GL"]
     for inc in d.get("AdditionalIncludeDirectories", "").split(";"):
         if inc and not inc.startswith("%"):
             f += ["/I", inc]
@@ -358,7 +383,10 @@ def cl_flags(lab):
         f += ["/D", "_UNICODE", "/D", "UNICODE"]
     f += ["/Gm-", "/EHsc"]
     f += ["/RTC1", "/MDd"] if dbg else ["/MD"]
-    f += ["/GS", "/fp:precise", "/Zc:wchar_t", "/Zc:forScope", "/Zc:inline"]
+    f += ["/GS"]
+    if not dbg:
+        f += ["/Gy"]
+    f += ["/fp:precise", "/Zc:wchar_t", "/Zc:forScope", "/Zc:inline"]
     std = {"stdcpp14": "/std:c++14", "stdcpp17": "/std:c++17", "stdcpp20": "/std:c++20", "stdcpplatest": "/std:c++latest"}.get(d.get("LanguageStandard"))
     if std:
         f += [std]
@@ -367,7 +395,12 @@ def cl_flags(lab):
     return f
 
 
-CL_TAIL = ["/external:W3", "/Gd", "/TP", "/FC"]  # after /Fo /Fd, as in the real tlog
+def cl_tail():
+    """what follows the switches: output folders, then the fixed tail (x86 adds /analyze-)"""
+    t = [f'/Fo"{CFG.rel}\\\\"', f'/Fd"{CFG.rel}\\vc145.pdb"', "/external:W3", "/Gd", "/TP"]
+    if CFG.x86:
+        t += ["/analyze-"]
+    return t + ["/FC"]
 
 
 def link_flags(lab, tc, outexe, pdb, implib, objs):
@@ -375,15 +408,21 @@ def link_flags(lab, tc, outexe, pdb, implib, objs):
     m = lab.itemdef("Manifest")
     libs = "kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib".split(";")
     extra = [x for x in d.get("AdditionalDependencies", "").split(";") if x and not x.startswith("%")]
-    f = [f"/OUT:{outexe}", "/INCREMENTAL", rf"/ILK:x64\Debug\{lab.name}.ilk", "/NOLOGO", *libs, *extra, "/MANIFEST",
-         "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+    f = [f"/OUT:{outexe}"]
+    if CFG.dbg:
+        f += ["/INCREMENTAL", rf"/ILK:{CFG.rel}\{lab.name}.ilk"]
+    f += ["/NOLOGO", *libs, *extra, "/MANIFEST", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
     if m.get("EnableSegmentHeap") == "true":
         f += ["/manifest:embed", rf"/manifestinput:{tc.vc_win}\include\manifest\segmentheap.manifest"]
     else:
         f += ["/manifest:embed"]
-    f += ["/DEBUG", f"/PDB:{pdb}", f"/SUBSYSTEM:{d.get('SubSystem', 'Console').upper()}", "/TLBID:1", "/DYNAMICBASE", "/NXCOMPAT",
-          f"/IMPLIB:{implib}", "/MACHINE:X64"] + objs
-    return f
+    f += ["/DEBUG", f"/PDB:{pdb}", f"/SUBSYSTEM:{d.get('SubSystem', 'Console').upper()}"]
+    if not CFG.dbg:
+        f += ["/OPT:REF", "/OPT:ICF", "/LTCG:incremental", rf"/LTCGOUT:{CFG.rel}\{lab.name}.iobj"]
+    f += ["/TLBID:1", "/DYNAMICBASE", "/NXCOMPAT", f"/IMPLIB:{implib}", "/MACHINE:X86" if CFG.x86 else "/MACHINE:X64"]
+    if CFG.x86 and not CFG.dbg:
+        f += ["/SAFESEH"]
+    return f + objs
 
 
 def u16(path, text, bom=True):
@@ -397,8 +436,8 @@ def cmd_build(a):
     tc.link_prefix(lab)
     if a.msbuild:
         return build_msbuild(lab, tc)
-    cfgdir = lab.proj_dir / "x64/Debug"
-    outdir = lab.sol_dir / "x64/Debug"
+    cfgdir = lab.proj_dir / CFG.rel_unix
+    outdir = lab.sol_dir / CFG.rel_unix
     # always a clean build ("Rebuild"): Visual Studio only recompiles what changed, which we do not track, and re-linking into old
     # .pdb/.ilk/.idb files would make them grow differently from a clean Visual Studio build
     shutil.rmtree(cfgdir, ignore_errors=True)
@@ -410,13 +449,13 @@ def cmd_build(a):
     if not srcs:
         sys.exit("vslab: no ClCompile items in the project (run vslab sync?)")
     wproj, wsol = lab.win_proj, lab.win_sol
-    cl = rf"{tc.vc_win}\bin\Hostx64\x64\cl.exe"
-    link = rf"{tc.vc_win}\bin\Hostx64\x64\link.exe"
+    cl = rf"{tc.vc_win}\bin\Hostx64\{CFG.plat}\cl.exe"
+    link = rf"{tc.vc_win}\bin\Hostx64\{CFG.plat}\link.exe"
     flags = cl_flags(lab)
-    tail = [r'/Fo"x64\Debug\\"', r'/Fd"x64\Debug\vc145.pdb"'] + CL_TAIL  # exactly what MSBuild passes
+    tail = cl_tail()  # exactly what MSBuild passes
     abs_srcs = [rf"{wproj}\{s}" for s in srcs]
     t0 = time.time()
-    say(f"Build started (Debug|x64, toolset v145, MSVC {tc.vcver}, SDK {tc.sdkver}, Wine)")
+    say(f"Build started ({CFG.key}, toolset v145, MSVC {tc.vcver}, SDK {tc.sdkver}, Wine)")
     rc, out = tc.run_in(wproj, cl, [*flags, "/showIncludes", "/errorReport:queue", *tail, *abs_srcs])
     includes, cur, logl = {}, None, []
     for line in out.split("\n"):
@@ -432,10 +471,10 @@ def cmd_build(a):
     print("\n".join(unix_display(lab, "  " + l) for l in logl))
     if rc != 0:
         sys.exit("vslab: compile failed")
-    objs = [rf"x64\Debug\{Path(s).stem}.obj" for s in srcs]
-    wexe = rf"{wsol}\x64\Debug\{lab.name}.exe"
-    wpdb = rf"{wsol}\x64\Debug\{lab.name}.pdb"
-    wlib = rf"{wsol}\x64\Debug\{lab.name}.lib"
+    objs = [rf"{CFG.rel}\{Path(s).stem}.obj" for s in srcs]
+    wexe = rf"{wsol}\{CFG.rel}\{lab.name}.exe"
+    wpdb = rf"{wsol}\{CFG.rel}\{lab.name}.pdb"
+    wlib = rf"{wsol}\{CFG.rel}\{lab.name}.lib"
     lflags = link_flags(lab, tc, wexe, wpdb, wlib, objs)
     rc2, out2 = tc.run_in(wproj, link, [q_link(x) for x in lflags] + ["/VERBOSE:LIB"])
     # /VERBOSE:LIB only serves to learn which libraries link really read (for link.read.1.tlog); it is not shown or logged
@@ -466,7 +505,7 @@ def unix_display(lab, line):
 
 def q_link(x):
     """quote a link switch like MSBuild does"""
-    if re.match(r"/(OUT|ILK|PDB|IMPLIB|manifestinput):", x):
+    if re.match(r"/(OUT|ILK|PDB|IMPLIB|LTCGOUT|manifestinput):", x):
         k, v = x.split(":", 1)
         return f'{k}:"{v}"'
     if x.startswith("/MANIFESTUAC:"):
@@ -481,34 +520,37 @@ def up(s):
 def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, objs, loglines, final, deflibs=()):
     """Write the MSBuild bookkeeping files from the commands that were really run.
     The command logs are exact; the read logs come from /showIncludes (same file set, order as cl saw it)."""
-    d = lab.proj_dir / "x64/Debug"
+    d = lab.proj_dir / CFG.rel_unix
     g8 = lab.guid.strip("{}").split("-")[0].lower()
     tl = d / f"{lab.name[:8]}.{g8}.tlog"
     tl.mkdir(exist_ok=True)
     (d / f"{lab.name[:8]}.{g8}_MD.tlog").mkdir(exist_ok=True)
     (d / "microsoft/STL").mkdir(parents=True, exist_ok=True)
     wproj, wsol = lab.win_proj, lab.win_sol
-    clcmd = " ".join(flags + [r'/Fo"X64\DEBUG\\"', r'/Fd"X64\DEBUG\VC145.PDB"'] + CL_TAIL)
+    clcmd = " ".join(flags + [t[:3] + t[3:].upper() if t.startswith(("/Fo", "/Fd")) else t for t in tail])
     u16(tl / "CL.command.1.tlog", "".join(f"^{up(s)}\n{clcmd} {up(s)}\n" for s in abs_srcs))
-    clui = rf"{tc.vc_win}\bin\Hostx64\x64\1033\clui.dll"
+    th = "Hostx86" if CFG.x86 else "Hostx64"  # VS runs the 32-bit tools for Win32; the records say so (we run the equivalent Hostx64 x86 cross tools under Wine)
+    clui = rf"{tc.vc_win}\bin\{th}\{CFG.plat}\1033\clui.dll"
     def deps(i, s):
         lst = [up(x.replace("/", "\\")) for x in dict.fromkeys(includes.get(s, []))]
         if i == 0:  # cl loads its resource DLL once, while processing the first file (position after <cstdint> in the reference build)
             k = next((n for n, x in enumerate(lst) if x.endswith("\\STDINT.H")), len(lst) - 1) + 1
             lst.insert(k, up(clui))
+        if i == 0 and CFG.x86:
+            lst.append(up(rf"{tc.vc_win}\bin\{th}\{CFG.plat}\vctip.exe"))
         return lst
     read = "".join(f"^{up(s)}\n" + "\n".join(deps(i, s)) + "\n" for i, s in enumerate(abs_srcs))
     u16(tl / "CL.read.1.tlog", read)
-    wr = "^" + "|".join(up(s) for s in abs_srcs) + "\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n" + up(rf"{wproj}\x64\Debug\vc145.idb") + "\n" + \
-         "\n".join(up(rf"{wproj}\x64\Debug\{Path(s).stem}.obj") for s in reversed(srcs)) + "\n"
-    wr += "".join(f"^{up(s)}\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n" for s in abs_srcs)
+    wr = "^" + "|".join(up(s) for s in abs_srcs) + "\n" + up(rf"{wproj}\{CFG.rel}\vc145.pdb") + "\n" + (up(rf"{wproj}\{CFG.rel}\vc145.idb") + "\n" if CFG.dbg else "") + \
+         "\n".join(up(rf"{wproj}\{CFG.rel}\{Path(s).stem}.obj") for s in reversed(srcs)) + "\n"
+    wr += "".join(f"^{up(s)}\n" + up(rf"{wproj}\{CFG.rel}\vc145.pdb") + "\n" for s in abs_srcs)
     u16(tl / "CL.write.1.tlog", wr)
-    (tl / "Cl.items.tlog").write_bytes("".join(f"{a};{wproj}\\x64\\Debug\\{PureWindowsPath(r).stem}.obj\r\n" for a, r in zip(abs_srcs, srcs)).encode())
-    objabs = [rf"{wproj}\x64\Debug\{Path(s).stem}.obj" for s in srcs]
+    (tl / "Cl.items.tlog").write_bytes("".join(f"{a};{wproj}\\{CFG.rel}\\{PureWindowsPath(r).stem}.obj\r\n" for a, r in zip(abs_srcs, srcs)).encode())
+    objabs = [rf"{wproj}\{CFG.rel}\{Path(s).stem}.obj" for s in srcs]
     jo = "|".join(up(o) for o in objabs)
     disp = []
     for x in lflags[:-len(objs)]:
-        if re.match(r"/(OUT|ILK|PDB|IMPLIB|manifestinput):", x):
+        if re.match(r"/(OUT|ILK|PDB|IMPLIB|LTCGOUT|manifestinput):", x):
             k, v = x.split(":", 1)
             x = f'{k}:"{up(v)}"'
         elif x.startswith("/MANIFESTUAC:"):
@@ -518,20 +560,35 @@ def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, 
         disp.append(x)
     u16(tl / "link.command.1.tlog", f"^{jo}\n{' '.join(disp)} {up(objs[0])}\n" + "\n".join(up(o) for o in objs[1:]) + "\n")
     libs = [x for x in lflags if x.lower().endswith(".lib") and "\\" not in x and not x.startswith("/")]
-    rd = f"^{jo}\n" + "\n".join(up(rf"{tc.sdk_win}\Lib\{tc.sdkver}\um\x64\{l}") for l in libs) + "\n" + "\n".join(up(o) for o in objabs) + "\n"
-    rd += up(rf"{tc.vc_win}\include\manifest\segmentheap.manifest") + "\n" + r"C:\WINDOWS\GLOBALIZATION\SORTING\SORTDEFAULT.NLS" + "\n"
-    rd += "".join(up(x) + "\n" for x in deflibs)
-    rd += up(rf"{tc.vc_win}\bin\Hostx64\x64\cvtres.exe") + "\n" + r"C:\WINDOWS\SYSTEM32\TZRES.DLL" + "\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n"
-    rd += "\\\\?\\" + up(rf"{tc.vc_win}\include\manifest\segmentheap.manifest") + "\n"
+    rd = f"^{jo}\n" + "\n".join(up(rf"{tc.sdk_win}\Lib\{tc.sdkver}\um\{CFG.plat}\{l}") for l in libs) + "\n" + "\n".join(up(o) for o in objabs) + "\n"
+    seg = up(rf"{tc.vc_win}\include\manifest\segmentheap.manifest")
+    nls = r"C:\WINDOWS\GLOBALIZATION\SORTING\SORTDEFAULT.NLS"
+    cvt = up(rf"{tc.vc_win}\bin\{th}\{CFG.plat}\cvtres.exe")
+    pdbp = up(rf"{wproj}\{CFG.rel}\vc145.pdb")
+    tzr = r"C:\WINDOWS\SYSTEM32\TZRES.DLL"
+    dl = "".join(up(x) + "\n" for x in deflibs)
+    mtrc = up(rf"{tc.sdk_win}\bin\{tc.sdkver}\{CFG.plat}\mt.exe") + "\n" + up(rf"{tc.sdk_win}\bin\{tc.sdkver}\{CFG.plat}\rc.exe") + "\n"
+    pdbsrv = up(rf"{tc.vc_win}\bin\{th}\{CFG.plat}\mspdbsrv.exe") + "\n"
+    c2 = up(rf"{tc.vc_win}\bin\{th}\{CFG.plat}\c2.dll") + "\n"
+    lui = up(rf"{tc.vc_win}\bin\{th}\{CFG.plat}\1033\linkui.dll") + "\n"
+    if CFG.dbg and not CFG.x86:
+        rd += seg + "\n" + nls + "\n" + dl + cvt + "\n" + tzr + "\n" + pdbp + "\n"
+    elif CFG.dbg:
+        rd += seg + "\n" + nls + "\n" + dl + mtrc + cvt + "\n" + pdbsrv + tzr + "\n"
+    elif not CFG.x86:  # link-time code generation: c2.dll and linkui.dll are read too, the manifest comes last
+        rd += nls + "\n" + c2 + dl + lui + pdbp + "\n" + cvt + "\n" + tzr + "\n" + seg + "\n"
+    else:
+        rd += nls + "\n" + c2 + dl + lui + pdbsrv + mtrc + cvt + "\n" + tzr + "\n" + seg + "\n"
+    rd += "\\\\?\\" + seg + "\n"
     u16(tl / "link.read.1.tlog", rd)
-    u16(tl / "link.write.1.tlog", f"^{jo}\n{up(rf'{wsol}\x64\Debug\{lab.name}.exe')}\n{up(rf'{wsol}\x64\Debug\{lab.name}.pdb')}\n")
-    (tl / "link.secondary.1.tlog").write_bytes(("^" + "|".join(up(o) for o in objabs) + f"\r\n{wproj}\\x64\\Debug\\{lab.name}.ilk\r\n").encode())
+    u16(tl / "link.write.1.tlog", f"^{jo}\n{up(rf'{wsol}\{CFG.rel}\{lab.name}.exe')}\n{up(rf'{wsol}\{CFG.rel}\{lab.name}.pdb')}\n")
+    (tl / "link.secondary.1.tlog").write_bytes(("^" + "|".join(up(o) for o in objabs) + ("\r\n" + (f"{wproj}\\{CFG.rel}\\{lab.name}.ilk\r\n" if CFG.dbg else f"{wproj}\\{CFG.rel}\\{lab.name}.IPDB\r\n{wproj}\\{CFG.rel}\\{lab.name}.iobj\r\n"))).encode())
     (tl / f"{lab.name}.lastbuildstate").write_bytes(
-        (f"PlatformToolSet=v145:VCToolArchitecture=Native64Bit:VCToolsVersion={tc.vcver}:{tc.servicing()}TargetPlatformVersion={tc.sdkver}:\r\n"
-         f"Debug|x64|{wsol}\\|\r\n").encode())
+        (f"PlatformToolSet=v145:VCToolArchitecture={'Native32Bit' if CFG.x86 else 'Native64Bit'}:VCToolsVersion={tc.vcver}:{tc.servicing()}TargetPlatformVersion={tc.sdkver}:\r\n"
+         f"{CFG.key}|{wsol}\\|\r\n").encode())
     (d / f"{lab.name}.exe.recipe").write_bytes(("\ufeff" + CRLF.join([
         '<?xml version="1.0" encoding="utf-8"?>', "<Project>", "  <ProjectOutputs>", "    <ProjectOutput>",
-        f"      <FullPath>{wsol}\\x64\\Debug\\{lab.name}.exe</FullPath>", "    </ProjectOutput>", "  </ProjectOutputs>",
+        f"      <FullPath>{wsol}\\{CFG.rel}\\{lab.name}.exe</FullPath>", "    </ProjectOutput>", "  </ProjectOutputs>",
         "  <ContentFiles />", "  <SatelliteDlls />", "  <NonRecipeFileRefs />", "</Project>"]) ).encode())
     log = "\n".join("  " + l.strip() if not l.startswith("  ") else l for l in loglines) + "\n" + final + "\n"
     (d / f"{lab.name}.log").write_bytes(("\ufeff" + log.replace("\n", CRLF)).encode())
@@ -572,17 +629,17 @@ def dt_command(lab, tc, doc):
         f += [std]
     if d.get("ConformanceMode", "true") == "true":
         f += ["/permissive-"]
-    f += ['/Fo"x64\\Debug\\\\"', "/external:W3", "/Gd", "/TP", "/errorReport:prompt"]
+    f += [f'/Fo"{CFG.rel}\\\\"', "/external:W3", "/Gd", "/TP", "/errorReport:prompt"]
     mid = (REPO / "templates/dt-includes.txt").read_text().replace("@VC@", tc.vcver).replace("@SDK@", tc.sdkver)
-    stem = f"x64\\Debug\\{doc}.obj.dt"
+    stem = f"{CFG.rel}\\{doc}.obj.dt"
     return (" ".join(f) + "  " + mid + f' /BCD "{lab.win_proj}\\\\" /scanDependencies "{stem}.module.json" /sourceDependencies "{stem}.d.json"'
             f' /D __INTELLISENSE__ "{lab.win_proj}\\{doc}"')
 
 
 def write_dt_files(lab, tc, docs):
     """run the real cl in dependency-scan mode for each document and keep VS's file names and command files"""
-    d = lab.proj_dir / "x64/Debug"
-    cl = rf"{tc.vc_win}\bin\Hostx64\x64\cl.exe"
+    d = lab.proj_dir / CFG.rel_unix
+    cl = rf"{tc.vc_win}\bin\Hostx64\{CFG.plat}\cl.exe"
     had = {n for n in ("vc140.idb", "vc140.pdb") if (lab.proj_dir / n).exists()}
     for doc in docs:
         cmd = dt_command(lab, tc, doc)
@@ -602,10 +659,10 @@ def cmd_run(a):
     lab = Lab()
     tc = Toolchain()
     tc.link_prefix(lab)
-    exe = lab.sol_dir / f"x64/Debug/{lab.name}.exe"
+    exe = lab.sol_dir / f"{CFG.rel_unix}/{lab.name}.exe"
     if not exe.exists():
         sys.exit("vslab: not built yet, run `vslab build`")
-    wexe = rf"{lab.win_sol}\x64\Debug\{lab.name}.exe"
+    wexe = rf"{lab.win_sol}\{CFG.rel}\{lab.name}.exe"
     # Visual Studio starts the program with the PROJECT folder as working directory
     t0 = time.time()
     p = subprocess.run([tc.wine, wexe, *a.args], cwd=str(lab.proj_dir), env=tc.env)
@@ -1111,6 +1168,8 @@ def cmd_doctor(a):
 
 def main():
     ap = argparse.ArgumentParser(prog="vslab", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-c", "--config", default=os.environ.get("VSLAB_CONFIG", "Debug"), choices=["Debug", "Release"], help="build configuration (default Debug)")
+    ap.add_argument("-p", "--platform", default=os.environ.get("VSLAB_PLATFORM", "x64"), choices=["x64", "x86", "Win32"], help="platform (default x64; Win32 = x86)")
     sp = ap.add_subparsers(dest="cmd", required=True)
     s = sp.add_parser("new"); s.add_argument("name"); s.add_argument("--dir"); s.set_defaults(f=cmd_new)
     s = sp.add_parser("sync"); s.add_argument("--all", action="store_true", help="also add every .txt file as a Text item"); s.set_defaults(f=cmd_sync)
@@ -1125,6 +1184,8 @@ def main():
     s = sp.add_parser("vscode"); s.set_defaults(f=cmd_vscode)
     s = sp.add_parser("doctor"); s.set_defaults(f=cmd_doctor)
     a = ap.parse_args()
+    global CFG
+    CFG = Cfg(a.config, a.platform)
     a.f(a)
 
 
