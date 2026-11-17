@@ -549,11 +549,14 @@ def load_gen(name):
     return m
 
 
-def refresh_cache(lab):
+def refresh_cache(lab, only=None):
     vs = lab.sol_dir / ".vs" / f"{lab.sol_name}.slnx"
     v18 = vs / "v18"
     (vs / "FileContentIndex").mkdir(parents=True, exist_ok=True)
     (v18 / "ipch/AutoPCH").mkdir(parents=True, exist_ok=True)
+    if only == "vsidx":
+        vsidx_only(lab, vs)
+        return
     data = layout_json(lab)
     (v18 / "DocumentLayout.json").write_bytes(data)
     (v18 / "DocumentLayout.backup.json").write_bytes(data)
@@ -567,10 +570,14 @@ def refresh_cache(lab):
         dest = v18 / fn
         g = load_gen(gens[fn])
         (g.generate(lab, dest) if g else job(dest))
-    # vsidx: one per solution. Real name is a GUID VS derives internally; we derive a stable one from the solution GUID.
-    vid = str(uuid.uuid5(uuid.NAMESPACE_URL, "vslab:" + lab.guid))
+    # vsidx: Visual Studio names it with a random GUID; keep an existing name, else make a new one
+    vdir = vs / "FileContentIndex"
+    old = sorted(vdir.glob("*.vsidx"))
+    vid = old[0].stem if old else str(uuid.uuid4())
+    for extra in old[1:]:
+        extra.unlink()
     g = load_gen("vsidx")
-    dest = vs / "FileContentIndex" / f"{vid}.vsidx"
+    dest = vdir / f"{vid}.vsidx"
     (g.generate(lab, dest) if g else dest.write_bytes(b""))
     # ipch/AutoPCH/<hash>/<SOURCE>.ipch : one per source file (names right, content empty unless a generator exists)
     g = load_gen("ipch")
@@ -581,6 +588,16 @@ def refresh_cache(lab):
         dest = d / (Path(s).stem.upper() + ".ipch")
         (g.generate(lab, dest) if g else dest.write_bytes(b""))
     say("editor cache written to", vs.relative_to(lab.sol_dir))
+
+
+def vsidx_only(lab, vs):
+    vdir = vs / "FileContentIndex"
+    vdir.mkdir(parents=True, exist_ok=True)
+    old = sorted(vdir.glob("*.vsidx"))
+    dest = old[0] if old else vdir / f"{uuid.uuid4()}.vsidx"
+    g = load_gen("vsidx")
+    if g:
+        g.generate(lab, dest)
 
 
 def cmd_cache(a):
@@ -626,6 +643,8 @@ def cmd_zip(a):
     out = Path(a.output) if a.output else lab.sol_dir.parent / f"{lab.sol_name}.zip"
     if not (lab.sol_dir / ".vs").exists():
         refresh_cache(lab)
+    else:
+        refresh_cache(lab, only="vsidx")  # index records the sources' current modification times
     base = lab.sol_dir.parent
     tmp = out.with_suffix(".zip.tmp")
     with open(tmp, "wb") as raw:
