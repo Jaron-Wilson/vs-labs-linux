@@ -1,0 +1,170 @@
+CREATE TABLE project ( id bigint NOT NULL CONSTRAINT pk_project_id PRIMARY KEY, projname text NOT NULL, file text NOT NULL, guid text NOT NULL, shared tinyint NOT NULL, time_stamp bigint NOT NULL, hash text NOT NULL, target_framework_version int NOT NULL, show_all_files tinyint NOT NULL, unsupported tinyint NOT NULL)
+;;
+CREATE UNIQUE INDEX uq_project_file ON project(file)
+;;
+CREATE UNIQUE INDEX uq_project_guid ON project(guid)
+;;
+CREATE TABLE project_extension_property ( project_id bigint NOT NULL CONSTRAINT fk_project_extension_property_project_id REFERENCES project(id) ON DELETE CASCADE, name bigint NOT NULL, value bigint NOT NULL)
+;;
+CREATE INDEX ix_project_extension_property_project_id ON project_extension_property(project_id)
+;;
+CREATE TABLE rule_file ( id bigint NOT NULL CONSTRAINT pk_rule_file_id PRIMARY KEY, file text NOT NULL, time_stamp bigint NOT NULL, hash text NOT NULL)
+;;
+CREATE UNIQUE INDEX uq_rule_file_file ON rule_file(file)
+;;
+CREATE TABLE item_type ( id bigint NOT NULL CONSTRAINT pk_item_type_id PRIMARY KEY, rule_file_id bigint NOT NULL CONSTRAINT fk_item_type_rule_file_id REFERENCES rule_file(id) ON DELETE CASCADE, name bigint NOT NULL)
+;;
+CREATE INDEX ix_item_type_rule_file_id ON item_type(rule_file_id)
+;;
+CREATE TABLE content_type ( id bigint NOT NULL CONSTRAINT pk_content_type_id PRIMARY KEY, rule_file_id bigint NOT NULL CONSTRAINT fk_content_type_rule_file_id REFERENCES rule_file(id) ON DELETE CASCADE, name text NOT NULL, display_name text NOT NULL, item_type_name bigint NOT NULL, default_for_item_type tinyint NOT NULL)
+;;
+CREATE INDEX ix_content_type_rule_file_id ON content_type(rule_file_id)
+;;
+CREATE TABLE file_extension ( id bigint NOT NULL CONSTRAINT pk_file_extension_id PRIMARY KEY, rule_file_id bigint NOT NULL CONSTRAINT fk_file_extension_rule_file_id REFERENCES rule_file(id) ON DELETE CASCADE, file_extension text NOT NULL, content_type_name bigint NOT NULL)
+;;
+CREATE INDEX ix_file_extension_rule_file_id ON file_extension(rule_file_id)
+;;
+CREATE TABLE rule ( id bigint NOT NULL CONSTRAINT pk_rule_id PRIMARY KEY, rule_file_id bigint NOT NULL CONSTRAINT fk_rule_rule_file_id REFERENCES rule_file(id) ON DELETE CASCADE, name text NOT NULL, rule_extension tinyint NOT NULL)
+;;
+CREATE INDEX ix_rule_rule_file_id ON rule(rule_file_id)
+;;
+CREATE UNIQUE INDEX uq_rule_rule_file_id_name ON rule (rule_file_id,name)
+;;
+CREATE TABLE rule_property ( rule_id bigint NOT NULL CONSTRAINT fk_rule_property_rule_id REFERENCES rule(id) ON DELETE CASCADE, name text NOT NULL, persist_name text NOT NULL, item_type_name bigint NOT NULL)
+;;
+CREATE INDEX ix_rule_property_rule_id ON rule_property(rule_id)
+;;
+CREATE UNIQUE INDEX uq_rule_property_rule_id_name ON rule_property (rule_id,name)
+;;
+CREATE TABLE rule_file_in_config ( config_id bigint NOT NULL CONSTRAINT fk_rule_file_in_config_config_id REFERENCES config(id) ON DELETE CASCADE, rule_file_id bigint NOT NULL)
+;;
+CREATE INDEX ix_rule_file_in_config_config_id ON rule_file_in_config(config_id)
+;;
+CREATE TABLE rule_in_config ( config_id bigint NOT NULL CONSTRAINT fk_rule_in_config_config_id REFERENCES config(id) ON DELETE CASCADE, name text NOT NULL, rule_id bigint NOT NULL)
+;;
+CREATE INDEX ix_rule_in_config_config_id ON rule_in_config(config_id)
+;;
+CREATE TABLE file_extension_in_project ( project_id bigint NOT NULL CONSTRAINT fk_file_extension_in_project_project_id REFERENCES project(id) ON DELETE CASCADE, file_extension text NOT NULL, content_type_name bigint NOT NULL)
+;;
+CREATE INDEX ix_file_extension_in_project_project_id ON file_extension_in_project(project_id)
+;;
+CREATE UNIQUE INDEX uq_file_extension_in_project_project_id_file_extension ON file_extension_in_project (project_id,file_extension)
+;;
+CREATE TABLE filter ( id bigint NOT NULL CONSTRAINT pk_filter_id PRIMARY KEY, project_id bigint NOT NULL CONSTRAINT fk_filter_project_id REFERENCES project(id) ON DELETE CASCADE, name text NOT NULL, unique_identifier text NOT NULL, extensions text NOT NULL, source_control_files tinyint NOT NULL)
+;;
+CREATE INDEX ix_filter_project_id ON filter(project_id)
+;;
+CREATE UNIQUE INDEX uq_filter_project_id_name ON filter (project_id,name)
+;;
+CREATE TABLE project_item_file ( id bigint NOT NULL CONSTRAINT pk_project_item_file_id PRIMARY KEY, project_id bigint NOT NULL CONSTRAINT fk_project_item_file_project_id REFERENCES project(id) ON DELETE CASCADE, containing_project_file bigint NOT NULL, file bigint NOT NULL, file_upper_hint text NOT NULL, item_type text NOT NULL, content_type text NOT NULL, sub_type text NOT NULL, generator_target text NOT NULL, build_target text NOT NULL, dependent_upon text NOT NULL, deployment_content tinyint NOT NULL, shared tinyint NOT NULL, has_children tinyint NOT NULL)
+;;
+CREATE INDEX ix_project_item_file_project_id ON project_item_file(project_id)
+;;
+CREATE INDEX ix_project_item_file_file_upper_hint ON project_item_file(file_upper_hint)
+;;
+CREATE INDEX ix_project_item_file_project_id_file_upper_hint ON project_item_file (project_id,file_upper_hint)
+;;
+CREATE TABLE file_under_filter ( project_item_id bigint NOT NULL, filter_id bigint NOT NULL CONSTRAINT fk_file_under_filter_filter_id REFERENCES filter(id) ON DELETE CASCADE)
+;;
+CREATE INDEX ix_file_under_filter_filter_id ON file_under_filter(filter_id)
+;;
+CREATE TABLE file_under_project ( project_item_id bigint NOT NULL, project_id bigint NOT NULL CONSTRAINT fk_file_under_project_project_id REFERENCES project(id) ON DELETE CASCADE)
+;;
+CREATE INDEX ix_file_under_project_project_id ON file_under_project(project_id)
+;;
+CREATE TABLE file_under_file ( project_item_id bigint NOT NULL, parent_file_id bigint NOT NULL CONSTRAINT fk_file_under_file_parent_file_id REFERENCES project_item_file(id) ON DELETE CASCADE)
+;;
+CREATE INDEX ix_file_under_file_parent_file_id ON file_under_file(parent_file_id)
+;;
+CREATE TABLE filter_under_project ( filter_id bigint NOT NULL, project_id bigint NOT NULL CONSTRAINT fk_filter_under_project_project_id REFERENCES project(id) ON DELETE CASCADE)
+;;
+CREATE INDEX ix_filter_under_project_project_id ON filter_under_project(project_id)
+;;
+CREATE TABLE filter_under_filter ( this_filter_id bigint NOT NULL, parent_filter_id bigint NOT NULL CONSTRAINT fk_filter_under_filter_parent_filter_id REFERENCES filter(id) ON DELETE CASCADE)
+;;
+CREATE INDEX ix_filter_under_filter_parent_filter_id ON filter_under_filter(parent_filter_id)
+;;
+CREATE TABLE generated_file ( config_id bigint NOT NULL CONSTRAINT fk_generated_file_config_id REFERENCES config(id) ON DELETE CASCADE, file bigint NOT NULL)
+;;
+CREATE INDEX ix_generated_file_config_id ON generated_file(config_id)
+;;
+CREATE TABLE config ( id bigint NOT NULL CONSTRAINT pk_config_id PRIMARY KEY, project_id bigint NOT NULL CONSTRAINT fk_config_project_id REFERENCES project(id) ON DELETE CASCADE, name text NOT NULL, evaluation_id bigint NOT NULL, static_data_time_stamp bigint NOT NULL, dynamic_data_time_stamp bigint NOT NULL)
+;;
+CREATE INDEX ix_config_project_id ON config(project_id)
+;;
+CREATE UNIQUE INDEX uq_config_project_id_name ON config (project_id,name)
+;;
+CREATE TABLE config_import ( id bigint NOT NULL CONSTRAINT pk_config_import_id PRIMARY KEY, config_id bigint NOT NULL CONSTRAINT fk_config_import_config_id REFERENCES config(id) ON DELETE CASCADE, import_file bigint NOT NULL, importing_file bigint NOT NULL, import_group_label text NOT NULL, import_label text NOT NULL, import_file_hash text NOT NULL)
+;;
+CREATE INDEX ix_config_import_config_id ON config_import(config_id)
+;;
+CREATE TABLE config_dependency ( id bigint NOT NULL CONSTRAINT pk_config_dependency_id PRIMARY KEY, config_id bigint NOT NULL CONSTRAINT fk_config_dependency_config_id REFERENCES config(id) ON DELETE CASCADE, dependency_file bigint NOT NULL, dependency_file_hash text NOT NULL)
+;;
+CREATE INDEX ix_config_dependency_config_id ON config_dependency(config_id)
+;;
+CREATE TABLE config_auto_import_directory ( id bigint NOT NULL CONSTRAINT pk_config_auto_import_directory_id PRIMARY KEY, config_id bigint NOT NULL CONSTRAINT fk_config_auto_import_directory_config_id REFERENCES config(id) ON DELETE CASCADE, directory bigint NOT NULL, import_pattern bigint NOT NULL, imports_hash bigint NOT NULL)
+;;
+CREATE INDEX ix_config_auto_import_directory_config_id ON config_auto_import_directory(config_id)
+;;
+CREATE TABLE reference ( id bigint NOT NULL CONSTRAINT pk_reference_id PRIMARY KEY, config_id bigint NOT NULL CONSTRAINT fk_reference_config_id REFERENCES config(id) ON DELETE CASCADE, identity bigint NOT NULL, reference_type int NOT NULL)
+;;
+CREATE INDEX ix_reference_config_id ON reference(config_id)
+;;
+CREATE UNIQUE INDEX uq_reference_config_id_reference_type_identity ON reference (config_id,reference_type,identity)
+;;
+CREATE TABLE reference_attribute ( reference_id bigint NOT NULL CONSTRAINT fk_reference_attribute_reference_id REFERENCES reference(id) ON DELETE CASCADE, name bigint NOT NULL, value bigint NOT NULL)
+;;
+CREATE INDEX ix_reference_attribute_reference_id ON reference_attribute(reference_id)
+;;
+CREATE UNIQUE INDEX uq_reference_attribute_reference_id_name ON reference_attribute (reference_id,name)
+;;
+CREATE TABLE shared_import ( project_id bigint NOT NULL CONSTRAINT fk_shared_import_project_id REFERENCES project(id) ON DELETE CASCADE, name text NOT NULL)
+;;
+CREATE INDEX ix_shared_import_project_id ON shared_import(project_id)
+;;
+CREATE TABLE config_property ( config_id bigint NOT NULL CONSTRAINT fk_config_property_config_id REFERENCES config(id) ON DELETE CASCADE, name bigint NOT NULL, value bigint NOT NULL)
+;;
+CREATE INDEX ix_config_property_config_id ON config_property(config_id)
+;;
+CREATE UNIQUE INDEX uq_config_property_config_id_name ON config_property (config_id,name)
+;;
+CREATE TABLE config_item_type_property ( config_id bigint NOT NULL CONSTRAINT fk_config_item_type_property_config_id REFERENCES config(id) ON DELETE CASCADE, name bigint NOT NULL, value bigint NOT NULL, item_type bigint NOT NULL)
+;;
+CREATE INDEX ix_config_item_type_property_config_id ON config_item_type_property(config_id)
+;;
+CREATE UNIQUE INDEX uq_config_item_type_property_config_id_item_type_name ON config_item_type_property (config_id,item_type,name)
+;;
+CREATE TABLE config_item_property ( config_id bigint NOT NULL CONSTRAINT fk_config_item_property_config_id REFERENCES config(id) ON DELETE CASCADE, project_item_file_id bigint NOT NULL, name bigint NOT NULL, value bigint NOT NULL)
+;;
+CREATE INDEX ix_config_item_property_config_id ON config_item_property(config_id)
+;;
+CREATE UNIQUE INDEX uq_config_item_property_config_id_project_item_file_id_name ON config_item_property (config_id,project_item_file_id,name)
+;;
+CREATE TABLE config_capability ( config_id bigint NOT NULL CONSTRAINT fk_config_capability_config_id REFERENCES config(id) ON DELETE CASCADE, value text NOT NULL)
+;;
+CREATE INDEX ix_config_capability_config_id ON config_capability(config_id)
+;;
+CREATE TABLE config_special_target ( config_id bigint NOT NULL CONSTRAINT fk_config_special_target_config_id REFERENCES config(id) ON DELETE CASCADE, value text NOT NULL)
+;;
+CREATE INDEX ix_config_special_target_config_id ON config_special_target(config_id)
+;;
+CREATE TABLE command_line ( id bigint NOT NULL CONSTRAINT pk_command_line_id PRIMARY KEY, config_id bigint NOT NULL CONSTRAINT fk_command_line_config_id REFERENCES config(id) ON DELETE CASCADE, command_line bigint NOT NULL, is_default tinyint NOT NULL, contains_referenced_projects_data tinyint NOT NULL)
+;;
+CREATE INDEX ix_command_line_config_id ON command_line(config_id)
+;;
+CREATE TABLE command_line_file ( command_line_id bigint NOT NULL CONSTRAINT fk_command_line_file_command_line_id REFERENCES command_line(id) ON DELETE CASCADE, file bigint NOT NULL)
+;;
+CREATE INDEX ix_command_line_file_command_line_id ON command_line_file(command_line_id)
+;;
+CREATE TABLE command_line_for_reference ( config_id bigint NOT NULL CONSTRAINT fk_command_line_for_reference_config_id REFERENCES config(id) ON DELETE CASCADE, command_line bigint NOT NULL)
+;;
+CREATE INDEX ix_command_line_for_reference_config_id ON command_line_for_reference(config_id)
+;;
+CREATE TABLE property ( name text NOT NULL, value text NOT NULL)
+;;
+CREATE UNIQUE INDEX uq_property_name ON property(name)
+;;
+CREATE TABLE shared_text ( id bigint NOT NULL CONSTRAINT pk_shared_text_id PRIMARY KEY, text text NOT NULL)
+;;
+CREATE UNIQUE INDEX uq_shared_text_text ON shared_text(text)
+;;

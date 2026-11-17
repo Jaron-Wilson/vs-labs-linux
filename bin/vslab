@@ -614,16 +614,20 @@ def refresh_cache(lab, only=None):
         data = layout_json(lab)
         (v18 / "DocumentLayout.json").write_bytes(data)
         (v18 / "DocumentLayout.backup.json").write_bytes(data)
-    jobs = {
-        "Browse.VC.db": lambda p: make_db(p, "Browse.VC.db.sql"),
-        "Solution.VC.db": lambda p: make_db(p, "Solution.VC.db.sql"),
-        ".suo": lambda p: p.write_bytes(b""),
-    }
-    gens = {"Browse.VC.db": "browse", "Solution.VC.db": "solution", ".suo": "suo"}
-    for fn, job in jobs.items():
-        dest = v18 / fn
-        g = load_gen(gens[fn])
-        (g.generate(lab, dest) if g else job(dest))
+    gs = load_gen("solution")
+    gs.generate(lab, v18 / "Solution.VC.db") if gs else make_db(v18 / "Solution.VC.db", "Solution.VC.db.sql")
+    gb = load_gen("browse")
+    done = False
+    if gb and gb.available(str(ROOT)):
+        try:
+            gb.generate(lab, v18 / "Browse.VC.db")
+            done = True
+        except Exception as e:
+            say("Browse.VC.db generator failed, using schema only:", str(e)[:300])
+    if not done:
+        make_db(v18 / "Browse.VC.db", "Browse.VC.db.sql")
+    gu = load_gen("suo")
+    gu.generate(lab, v18 / ".suo") if gu else (v18 / ".suo").write_bytes(b"")
     # vsidx: Visual Studio names it with a random GUID; keep an existing name, else make a new one
     vdir = vs / "FileContentIndex"
     old = sorted(vdir.glob("*.vsidx"))
@@ -648,6 +652,26 @@ def vsidx_only(lab, vs):
     g = load_gen("vsidx")
     if g:
         g.generate(lab, dest)
+
+
+def cmd_seed(a):
+    """take Browse.VC.db out of a zip/folder written by real Visual Studio 18 (yours or your teacher's) as the seed for system-header rows"""
+    src = Path(a.source)
+    dst = ROOT / "reference"
+    dst.mkdir(parents=True, exist_ok=True)
+    if src.is_file() and zipfile.is_zipfile(src):
+        z = zipfile.ZipFile(src)
+        names = [n for n in z.namelist() if n.endswith("/Browse.VC.db") or n == "Browse.VC.db"]
+        if not names:
+            sys.exit("vslab: no Browse.VC.db in that zip")
+        with z.open(names[0]) as i, open(dst / "Browse.VC.db", "wb") as o:
+            shutil.copyfileobj(i, o)
+    else:
+        f = next(iter(src.rglob("Browse.VC.db")), None)
+        if not f:
+            sys.exit("vslab: no Browse.VC.db found")
+        shutil.copyfile(f, dst / "Browse.VC.db")
+    say("seed saved:", dst / "Browse.VC.db", f"({(dst / 'Browse.VC.db').stat().st_size // 1024} KiB)")
 
 
 def cmd_cache(a):
@@ -905,6 +929,7 @@ def main():
     s = sp.add_parser("build"); s.add_argument("--msbuild", action="store_true", help="use the real MSBuild (experimental under Wine)"); s.set_defaults(f=cmd_build)
     s = sp.add_parser("run"); s.add_argument("--debug-style", action="store_true", help="print the F5 'exited with code' message instead of Ctrl+F5's"); s.add_argument("args", nargs="*"); s.set_defaults(f=cmd_run)
     s = sp.add_parser("cache"); s.set_defaults(f=cmd_cache)
+    s = sp.add_parser("seed", help="use Browse.VC.db from a real Visual Studio zip for system header rows"); s.add_argument("source"); s.set_defaults(f=cmd_seed)
     s = sp.add_parser("zip"); s.add_argument("-o", "--output"); s.set_defaults(f=cmd_zip)
     s = sp.add_parser("check"); s.add_argument("ref"); s.add_argument("cand"); s.add_argument("--ignore-case", action="store_true"); s.set_defaults(f=cmd_check)
     s = sp.add_parser("vscode"); s.set_defaults(f=cmd_vscode)
