@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""vslab: Visual Studio C++ lab workflow on Linux.
+
+  vslab new <Name>            create <Name>_sol with the same files Visual Studio creates
+  vslab sync                  add/remove project items to match the files on disk (like VS "Add Existing Item")
+  vslab build                 build Debug|x64 with the real Microsoft toolchain under Wine
+  vslab run                   run the exe the way Visual Studio's Ctrl+F5 does
+  vslab cache                 (re)create the .vs editor-cache folder
+  vslab zip [-o FILE]         zip the solution folder with the same layout/metadata as the reference zip
+  vslab check REF CAND        compare two zips/folders file by file
+  vslab doctor                show what is installed
+
+Pure standard-library Python 3. Microsoft binaries are never bundled: install.sh downloads them
+from Microsoft after the user accepts the license.
+"""
+import argparse, hashlib, io, json, os, re, shutil, sqlite3, struct, subprocess, sys, time, uuid, zipfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get("VSLAB_ROOT", Path.home() / ".local/share/vslab"))
+WINUSER = os.environ.get("VSLAB_WINUSER", os.environ.get("USER", "user"))
+CRLF = "\r\n"
+
+
+# --------------------------------------------------------------------------- project model
+class Lab:
+    def __init__(self, start=None):
+        d = Path(start or os.getcwd()).resolve()
+        sln = None
+        for p in [d, *d.parents]:
+            c = sorted(p.glob("*.slnx"))
+            if c:
+                sln = c[0]
+                break
+            if p == Path.home():
+                break
+        if not sln:
+            sys.exit("vslab: no .slnx found here or in a parent folder")
+        self.sol_dir = sln.parent
+        self.sol_name = sln.stem
+        txt = sln.read_text(encoding="utf-8")
+        m = re.search(r'<Project Path="([^"]+\.vcxproj)"\s+Id="([^"]+)"', txt)
+        if not m:
+            sys.exit("vslab: no vcxproj in " + str(sln))
+        self.proj_rel = m.group(1)
+        self.guid = m.group(2)
+        self.proj_path = self.sol_dir / self.proj_rel
+        self.proj_dir = self.proj_path.parent
+        self.name = self.proj_path.stem
+        self.vcx = self.proj_path.read_text(encoding="utf-8-sig")
+
+    # windows view of the tree (the repos symlink inside the Wine prefix points at sol_dir.parent)
+    @property
+    def win_repos(self):
+        return rf"C:\Users\{WINUSER}\source\repos"
+
+    @property
+    def win_sol(self):
+        return rf"{self.win_repos}\{self.sol_name}"  # no trailing backslash
+
+    @property
+    def win_proj(self):
+        return rf"{self.win_sol}\{self.proj_dir.relative_to(self.sol_dir)}".replace("/", "\\")
+
+    def sources(self):
+        return [m.replace("/", "\\") for m in re.findall(r'<ClCompile Include="([^"]+)"', self.vcx)]
+
+    def itemdef(self, tool, cfg="Debug|x64"):
+        """metadata of <ItemDefinitionGroup Condition=cfg><tool>...</tool> as dict"""
+        for g in re.finditer(r"<ItemDefinitionGroup Condition=\"([^\"]*)\">(.*?)</ItemDefinitionGroup>", self.vcx, re.S):
+            if cfg in g.group(1):
+                t = re.search(rf"<{tool}>(.*?)</{tool}>", g.group(2), re.S)
+                if t:
+                    return dict(re.findall(r"<(\w+)>(.*?)</\1>", t.group(1), re.S))
+        return {}
+
+    def prop(self, name, cfg="Debug|x64"):
+        for g in re.finditer(r"<PropertyGroup Condition=\"([^\"]*)\" Label=\"Configuration\">(.*?)</PropertyGroup>", self.vcx, re.S):
+            if cfg in g.group(1):
+                m = re.search(rf"<{name}>(.*?)</{name}>", g.group(2))
+                return m.group(1) if m else None
+
+
+def say(*a):
+    print("vslab:", *a, flush=True)
+
+
+# --------------------------------------------------------------------------- new / sync
+def safe_ns(name):
+    ns = re.sub(r"[^A-Za-z0-9]", "", name) or "Project"
+    return ("x" + ns) if ns[0].isdigit() else ns
+
+
+ITEM_TYPES = [
+    ("ClCompile", (".cpp", ".c", ".cc", ".cxx"), "Source Files"),
+    ("ClInclude", (".h", ".hpp", ".hh", ".hxx", ".inl"), "Header Files"),
+    ("Text", (".txt",), "Resource Files"),
+]
+
+
+def render_itemgroups(items, filters):
+    """items: {type: [file,...]}; returns text of the ItemGroups (LF line ends, 2-space XML like VS)"""
+    out = []
+    for typ, _, flt in ITEM_TYPES:
+        files = items.get(typ, [])
+        if not files:
+            continue
+        out.append("  <ItemGroup>\n")
+        for f in files:
+            if filters:
+                out.append(f'    <{typ} Include="{f}">\n      <Filter>{flt}</Filter>\n    </{typ}>\n')
+            else:
+                out.append(f'    <{typ} Include="{f}" />\n')
+        out.append("  </ItemGroup>\n")
+    return "".join(out)
+
+
+def write_project_files(sol_dir, name, guid, items):
+    t = REPO / "templates"
+    ns = safe_ns(name)
+
+    def fill(b):
+        return b.replace("@@NAME@@", name).replace("@@GUID@@", guid).replace("@@ROOTNS@@", ns)
+
+    pdir = sol_dir / name
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / f"{name}.vcxproj").write_text(
+        fill((t / "Project.vcxproj.in").read_text()).replace("@@ITEMGROUPS@@", render_itemgroups(items, False)), newline="")
+    (pdir / f"{name}.vcxproj.filters").write_text(
+        (t / "Project.vcxproj.filters.in").read_text().replace("@@ITEMGROUPS@@", render_itemgroups(items, True)), newline="")
+
+
+HELLO = """#include <iostream>
+
+int main()
+{
+    std::cout << "Hello World!\\n";
+}
+
+// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
+// Debug program: F5 or Debug > Start Debugging menu
+
+// Tips for Getting Started: 
+//   1. Use the Solution Explorer window to add/manage files
+//   2. Use the Team Explorer window to connect to source control
+//   3. Use the Output window to see build output and other messages
+//   4. Use the Error List window to view errors
+//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
+//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
+"""
+
+
+def cmd_new(a):
+    name = a.name
+    base = Path(a.dir or ".").resolve()
+    sol_name = name if name.endswith("_sol") else name + "_sol"
+    pname = name[:-4] if name.endswith("_sol") else name
+    sol_dir = base / sol_name
+    if sol_dir.exists():
+        sys.exit(f"vslab: {sol_dir} already exists")
+    guid = str(uuid.uuid4())
+    t = REPO / "templates"
+    sol_dir.mkdir(parents=True)
+    (sol_dir / f"{sol_name}.slnx").write_text(
+        (t / "Solution.slnx.in").read_text().replace("@@NAME@@", pname).replace("@@GUID@@", guid), newline="")
+    (sol_dir / pname).mkdir()
+    cpp = f"{pname}.cpp"
+    (sol_dir / pname / cpp).write_text(HELLO, newline="")
+    say("tip: `vslab vscode` inside the folder adds VS Code build/run/debug tasks")
+    write_project_files(sol_dir, pname, guid, {"ClCompile": [cpp]})
+    shutil.copyfile(t / "Project.vcxproj.user", sol_dir / pname / f"{pname}.vcxproj.user")
+    say(f"created {sol_dir}")
+    for p in sorted(sol_dir.rglob("*")):
+        print("   ", p.relative_to(base))
+
+
+def cmd_sync(a):
+    lab = Lab()
+    cur = {t: re.findall(rf'<{t} Include="([^"]+)"', lab.vcx) for t, _, _ in ITEM_TYPES}
+    new = {}
+    for typ, exts, _ in ITEM_TYPES:
+        keep = [f for f in cur[typ] if (lab.proj_dir / f.replace("\\", "/")).exists()]
+        for p in sorted(lab.proj_dir.iterdir(), key=lambda p: p.name):
+            if p.is_file() and p.suffix.lower() in exts and p.name not in keep and (a.all or typ != "Text"):
+                keep.append(p.name)
+        new[typ] = keep
+    guid = lab.guid.strip("{}")
+    # keep the user's settings: only the item groups are rewritten
+    head = lab.vcx[: lab.vcx.index("  <ItemGroup>\n    <ClCompile")] if "  <ItemGroup>\n    <ClCompile" in lab.vcx else None
+    if head is None:
+        sys.exit("vslab sync: could not find the item groups in the vcxproj")
+    tail = lab.vcx[lab.vcx.index('  <Import Project="$(VCTargetsPath)\\Microsoft.Cpp.targets"'):]
+    lab.proj_path.write_text(head + render_itemgroups(new, False) + tail, newline="")
+    flt = lab.proj_path.with_suffix(".vcxproj.filters")
+    if flt.exists():
+        ft = flt.read_text(encoding="utf-8-sig")
+        i = ft.index("  <ItemGroup>\n    <ClCompile") if "  <ItemGroup>\n    <ClCompile" in ft else ft.index("</Project>")
+        flt.write_text(ft[:i] + render_itemgroups(new, True) + "</Project>\n", newline="")
+    say("project items updated:", {k: len(v) for k, v in new.items()})
+
+
+# --------------------------------------------------------------------------- toolchain / wine
+def wine_env():
+    env = dict(os.environ)
+    envsh = ROOT / "env.sh"
+    if envsh.exists():
+        out = subprocess.run(["bash", "-c", f'. "{envsh}" && env -0'], capture_output=True, check=True).stdout
+        env = dict(kv.split("=", 1) for kv in out.decode().split("\0") if "=" in kv)
+    env.setdefault("WINEPREFIX", str(ROOT / "wineprefix"))
+    env.setdefault("WINEDEBUG", "-all")
+    return env
+
+
+def wine_bin(env):
+    for n in ("wine64", "wine"):
+        if shutil.which(n, path=env.get("PATH")):
+            return n
+    sys.exit("vslab: wine not found (run install.sh)")
+
+
+class Toolchain:
+    def __init__(self):
+        self.msvc = ROOT / "msvc"
+        if not (self.msvc / "VC/Tools/MSVC").is_dir():
+            sys.exit(f"vslab: MSVC is not installed in {self.msvc}. Run install.sh (it shows Microsoft's license and asks for your yes).")
+        vers = sorted(p.name for p in (self.msvc / "VC/Tools/MSVC").iterdir() if (p / "bin").is_dir())
+        self.vcver = vers[-1]
+        kits = self.msvc / "Windows Kits/10"
+        self.sdkver = sorted(p.name for p in (kits / "Include").iterdir() if p.name[0].isdigit())[-1]
+        self.env = wine_env()
+        self.wine = wine_bin(self.env)
+        self.prefix = Path(self.env["WINEPREFIX"])
+
+    def link_prefix(self, lab):
+        """make the Windows paths of the real PC exist inside the prefix:
+        C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC, C:\\Program Files (x86)\\Windows Kits\\10,
+        C:\\Users\\<you>\\source\\repos -> the folder that holds the solution folder."""
+        c = self.prefix / "drive_c"
+        def sym(path, target):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink() or path.exists():
+                if path.is_symlink() and os.readlink(path) == str(target):
+                    return
+                path.unlink()
+            path.symlink_to(target)
+        sym(c / "Program Files/Microsoft Visual Studio/18/Community/VC", (self.msvc / "VC").resolve())
+        sym(c / "Program Files (x86)/Windows Kits/10", (self.msvc / "Windows Kits/10").resolve())
+        sym(c / f"users/{WINUSER}/source/repos", lab.sol_dir.parent)
+
+    @property
+    def vc_win(self):
+        return rf"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\{self.vcver}"
+
+    @property
+    def sdk_win(self):
+        return r"C:\Program Files (x86)\Windows Kits\10"
+
+    def msvc_env(self):
+        e = dict(self.env)
+        sdk, v = self.sdk_win, self.sdkver
+        e["INCLUDE"] = ";".join([rf"{self.vc_win}\include"] + [rf"{sdk}\Include\{v}\{x}" for x in ("ucrt", "shared", "um", "winrt", "cppwinrt")])
+        e["LIB"] = ";".join([rf"{self.vc_win}\lib\x64", rf"{sdk}\Lib\{v}\ucrt\x64", rf"{sdk}\Lib\{v}\um\x64"])
+        e["VSLAB_DUMMY"] = "1"
+        return e
+
+    def run(self, args, cwd, echo_filter=None):
+        """run a Windows program under wine, return (rc, stdout text)"""
+        p = subprocess.run([self.wine, *args], cwd=str(cwd), env=self.msvc_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+
+
+# --------------------------------------------------------------------------- build
+def cl_flags(lab):
+    """Debug|x64 cl switches, in the order MSBuild/VS 18 (toolset v145) writes them to CL.command.1.tlog."""
+    d = lab.itemdef("ClCompile")
+    dbg = lab.prop("UseDebugLibraries") == "true"
+    f = ["/c"]
+    f += ["/ZI", "/JMC"] if dbg else ["/Zi"]
+    f += ["/nologo"]
+    f += {"Level1": ["/W1"], "Level2": ["/W2"], "Level3": ["/W3"], "Level4": ["/W4"], "EnableAllWarnings": ["/Wall"],
+          "TurnOffAllWarnings": ["/W0"]}.get(d.get("WarningLevel", "Level3"), ["/W3"])
+    f += ["/WX-", "/diagnostics:column"]
+    if d.get("SDLCheck") == "true":
+        f += ["/sdl"]
+    f += ["/Od"] if dbg else ["/O2", "/Oi", "/GL", "/Gy"]
+    for inc in d.get("AdditionalIncludeDirectories", "").split(";"):
+        if inc and not inc.startswith("%"):
+            f += ["/I", inc]
+    for dfn in d.get("PreprocessorDefinitions", "").split(";"):
+        if dfn and not dfn.startswith("%"):
+            f += ["/D", dfn]
+    if lab.prop("CharacterSet") == "Unicode":
+        f += ["/D", "_UNICODE", "/D", "UNICODE"]
+    f += ["/Gm-", "/EHsc"]
+    f += ["/RTC1", "/MDd"] if dbg else ["/MD"]
+    f += ["/GS", "/fp:precise", "/Zc:wchar_t", "/Zc:forScope", "/Zc:inline"]
+    std = {"stdcpp14": "/std:c++14", "stdcpp17": "/std:c++17", "stdcpp20": "/std:c++20", "stdcpplatest": "/std:c++latest"}.get(d.get("LanguageStandard"))
+    if std:
+        f += [std]
+    if d.get("ConformanceMode", "true") == "true":
+        f += ["/permissive-"]
+    return f
+
+
+CL_TAIL = ["/external:W3", "/Gd", "/TP", "/FC"]  # after /Fo /Fd, as in the real tlog
+
+
+def link_flags(lab, tc, outexe, pdb, implib, objs):
+    d = lab.itemdef("Link")
+    m = lab.itemdef("Manifest")
+    libs = "kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib".split(";")
+    extra = [x for x in d.get("AdditionalDependencies", "").split(";") if x and not x.startswith("%")]
+    f = [f"/OUT:{outexe}", "/INCREMENTAL", rf"/ILK:x64\Debug\{lab.name}.ilk", "/NOLOGO", *libs, *extra, "/MANIFEST",
+         "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+    if m.get("EnableSegmentHeap") == "true":
+        f += ["/manifest:embed", rf"/manifestinput:{tc.vc_win}\include\manifest\segmentheap.manifest"]
+    else:
+        f += ["/manifest:embed"]
+    f += ["/DEBUG", f"/PDB:{pdb}", f"/SUBSYSTEM:{d.get('SubSystem', 'Console').upper()}", "/TLBID:1", "/DYNAMICBASE", "/NXCOMPAT",
+          f"/IMPLIB:{implib}", "/MACHINE:X64"] + objs
+    return f
+
+
+def u16(path, text, bom=True):
+    data = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    path.write_bytes((b"\xff\xfe" if bom else b"") + data.encode("utf-16-le"))
+
+
+def cmd_build(a):
+    lab = Lab()
+    tc = Toolchain()
+    tc.link_prefix(lab)
+    if a.msbuild:
+        return build_msbuild(lab, tc)
+    cfgdir = lab.proj_dir / "x64/Debug"
+    outdir = lab.sol_dir / "x64/Debug"
+    cfgdir.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    srcs = lab.sources()
+    if not srcs:
+        sys.exit("vslab: no ClCompile items in the project (run vslab sync?)")
+    wproj, wsol = lab.win_proj, lab.win_sol
+    cl = rf"{tc.vc_win}\bin\Hostx64\x64\cl.exe"
+    link = rf"{tc.vc_win}\bin\Hostx64\x64\link.exe"
+    flags = cl_flags(lab)
+    tail = ["/Fox64\\Debug\\", "/Fdx64\\Debug\\vc145.pdb"] + CL_TAIL  # same as MSBuild's /Fo"x64\Debug\\" /Fd"..."
+    abs_srcs = [rf"{wproj}\{s}" for s in srcs]
+    t0 = time.time()
+    say(f"Build started (Debug|x64, toolset v145, MSVC {tc.vcver}, SDK {tc.sdkver}, Wine)")
+    rc, out = tc.run([cl, *flags, "/showIncludes", "/errorReport:queue", *tail, *abs_srcs], cfgdir)
+    includes, cur, logl = {}, None, []
+    for line in out.split("\n"):
+        mm = re.match(r"Note: including file:\s+(.*)", line)
+        if mm:
+            if cur:
+                includes.setdefault(cur, []).append(mm.group(1).strip())
+            continue
+        if line.strip():
+            logl.append(line)
+            if line.strip().endswith((".cpp", ".c", ".cc", ".cxx")) and ":" not in line:
+                cur = next((s for s in abs_srcs if s.lower().endswith("\\" + line.strip().lower())), cur)
+    print("\n".join(unix_display(lab, "  " + l) for l in logl))
+    if rc != 0:
+        sys.exit("vslab: compile failed")
+    objs = [rf"x64\Debug\{Path(s).stem}.obj" for s in srcs]
+    wexe = rf"{wsol}\x64\Debug\{lab.name}.exe"
+    wpdb = rf"{wsol}\x64\Debug\{lab.name}.pdb"
+    wlib = rf"{wsol}\x64\Debug\{lab.name}.lib"
+    lflags = link_flags(lab, tc, wexe, wpdb, wlib, objs)
+    rc2, out2 = tc.run([link, *lflags], lab.proj_dir)
+    lines2 = [l for l in out2.split("\n") if l.strip()]
+    print("\n".join(unix_display(lab, "  " + l) for l in lines2))
+    if rc2 != 0:
+        sys.exit("vslab: link failed")
+    final = f"  {lab.name}.vcxproj -> {wexe}"
+    print(final)
+    write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, objs, logl + lines2, final)
+    refresh_cache(lab)
+    say(f"Build succeeded in {time.time() - t0:.1f}s")
+
+
+def unix_display(lab, line):
+    """show Windows paths in compiler messages as real Linux paths so terminals and VS Code can click them"""
+    pre = lab.win_repos
+    return re.sub(re.escape(pre) + r"\\[^\s(:]*", lambda m: str(lab.sol_dir.parent) + m.group(0)[len(pre):].replace("\\", "/"), line)
+
+
+def up(s):
+    return s.upper()
+
+
+def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, objs, loglines, final):
+    """Write the MSBuild bookkeeping files from the commands that were really run.
+    The command logs are exact; the read logs come from /showIncludes (same file set, order as cl saw it)."""
+    d = lab.proj_dir / "x64/Debug"
+    g8 = lab.guid.strip("{}").split("-")[0].lower()
+    tl = d / f"{lab.name[:8]}.{g8}.tlog"
+    tl.mkdir(exist_ok=True)
+    (d / f"{lab.name[:8]}.{g8}_MD.tlog").mkdir(exist_ok=True)
+    (d / "microsoft/STL").mkdir(parents=True, exist_ok=True)
+    wproj, wsol = lab.win_proj, lab.win_sol
+    clcmd = " ".join(flags + [r'/Fo"X64\DEBUG\\"', r'/Fd"X64\DEBUG\VC145.PDB"'] + CL_TAIL)
+    u16(tl / "CL.command.1.tlog", "".join(f"^{up(s)}\n{clcmd} {up(s)}\n" for s in abs_srcs))
+    read = "".join(f"^{up(s)}\n" + "\n".join(up(i) for i in dict.fromkeys(includes.get(s, []))) + "\n" for s in abs_srcs)
+    u16(tl / "CL.read.1.tlog", read)
+    wr = "^" + "|".join(up(s) for s in abs_srcs) + "\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n" + up(rf"{wproj}\x64\Debug\vc145.idb") + "\n" + \
+         "\n".join(up(rf"{wproj}\x64\Debug\{Path(s).stem}.obj") for s in reversed(srcs)) + "\n"
+    u16(tl / "CL.write.1.tlog", wr)
+    (tl / "Cl.items.tlog").write_bytes("".join(f"{s};{rf'{wproj}\x64\Debug\{Path(s).stem}.obj'}\r\n" for s in abs_srcs).encode())
+    objabs = [rf"{wproj}\x64\Debug\{Path(s).stem}.obj" for s in srcs]
+    jo = "|".join(up(o) for o in objabs)
+    disp = []
+    for x in lflags[:-len(objs)]:
+        if re.match(r"/(OUT|ILK|PDB|IMPLIB|manifestinput):", x):
+            k, v = x.split(":", 1)
+            x = f'{k}:"{up(v)}"'
+        elif x.startswith("/MANIFESTUAC:"):
+            x = '/MANIFESTUAC:"' + x.split(":", 1)[1] + '"'
+        elif x.lower().endswith(".lib"):
+            x = up(x)
+        disp.append(x)
+    u16(tl / "link.command.1.tlog", f"^{jo}\n{' '.join(disp)} {up(objs[0])}\n" + "\n".join(up(o) for o in objs[1:]) + "\n")
+    libs = [x for x in lflags if x.lower().endswith(".lib") and "\\" not in x and not x.startswith("/")]
+    rd = f"^{jo}\n" + "\n".join(up(rf"{tc.sdk_win}\Lib\{tc.sdkver}\um\x64\{l}") for l in libs) + "\n"
+    u16(tl / "link.read.1.tlog", rd)
+    u16(tl / "link.write.1.tlog", f"^{jo}\n{up(rf'{wsol}\x64\Debug\{lab.name}.exe')}\n{up(rf'{wsol}\x64\Debug\{lab.name}.pdb')}\n")
+    (tl / "link.secondary.1.tlog").write_bytes(("^" + "\r\n".join(up(o) for o in objabs) + f"\r\n{wproj}\\x64\\Debug\\{lab.name}.ilk\r\n").encode())
+    (tl / f"{lab.name}.lastbuildstate").write_bytes(
+        (f"PlatformToolSet=v145:VCToolArchitecture=Native64Bit:VCToolsVersion={tc.vcver}:TargetPlatformVersion={tc.sdkver}:\r\n"
+         f"Debug|x64|{wsol}\\|\r\n").encode())
+    (d / f"{lab.name}.exe.recipe").write_bytes(("\ufeff" + CRLF.join([
+        '<?xml version="1.0" encoding="utf-8"?>', "<Project>", "  <ProjectOutputs>", "    <ProjectOutput>",
+        f"      <FullPath>{wsol}\\x64\\Debug\\{lab.name}.exe</FullPath>", "    </ProjectOutput>", "  </ProjectOutputs>",
+        "  <ContentFiles />", "  <SatelliteDlls />", "  <NonRecipeFileRefs />", "</Project>"]) ).encode())
+    log = "\n".join("  " + l.strip() if not l.startswith("  ") else l for l in loglines) + "\n" + final + "\n"
+    (d / f"{lab.name}.log").write_bytes(("\ufeff" + log.replace("\n", CRLF)).encode())
+
+
+def build_msbuild(lab, tc):
+    mb = ROOT / "msvc/MSBuild/Current/Bin/amd64/MSBuild.exe"
+    if not mb.exists():
+        mb = ROOT / "msvc/MSBuild/Current/Bin/MSBuild.exe"
+    if not mb.exists():
+        sys.exit("vslab: MSBuild.exe not installed (install.sh --with-msbuild)")
+    say("experimental: running the real MSBuild under Wine (needs .NET Framework in the prefix, see README)")
+    wsol = lab.win_sol
+    args = [str(mb), rf"{lab.win_proj}\{lab.name}.vcxproj", "/p:Configuration=Debug", "/p:Platform=x64",
+            rf"/p:SolutionDir={wsol}\\", "/nologo", "/v:n"]
+    rc, out = tc.run(args, lab.proj_dir)
+    print(out)
+    if rc == 0:
+        refresh_cache(lab)
+    sys.exit(rc)
+
+
+# --------------------------------------------------------------------------- run
+def cmd_run(a):
+    lab = Lab()
+    tc = Toolchain()
+    tc.link_prefix(lab)
+    exe = lab.sol_dir / f"x64/Debug/{lab.name}.exe"
+    if not exe.exists():
+        sys.exit("vslab: not built yet, run `vslab build`")
+    wexe = rf"{lab.win_sol}\x64\Debug\{lab.name}.exe"
+    # Visual Studio starts the program with the PROJECT folder as working directory
+    t0 = time.time()
+    p = subprocess.run([tc.wine, wexe, *a.args], cwd=str(lab.proj_dir), env=tc.env)
+    rc = p.returncode
+    if a.debug_style:  # F5 style, "Automatically close the console" off
+        print(f"\n{wexe} (process {os.getpid()}) exited with code {rc} (0x{rc & 0xFFFFFFFF:x}).")
+        print("Press any key to close this window . . .", end="", flush=True)
+    else:  # Ctrl+F5 style
+        print("\nPress any key to continue . . . ", end="", flush=True)
+    wait_key()
+    print()
+    sys.exit(rc)
+
+
+def wait_key():
+    if not sys.stdin.isatty():
+        return
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+# --------------------------------------------------------------------------- .vs cache
+class Ctx:
+    pass
+
+
+def sources_for_layout(lab):
+    docs = []
+    for f in sorted(lab.proj_dir.iterdir()):
+        if f.suffix.lower() in (".cpp", ".c", ".cc", ".cxx") and re.search(r"\bmain\s*\(", f.read_text(errors="ignore")):
+            docs.append(f.name)
+    return docs or lab.sources()[:1]
+
+
+def layout_json(lab):
+    g = lab.guid.strip("{}").upper()
+    vsproj = f"{lab.name}\\{lab.name}.vcxproj"
+    cpp_type = "{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    docs, children = [], []
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z"
+    for i, f in enumerate(sources_for_layout(lab)):
+        absp = f"{lab.win_sol}\\{lab.name}\\{f}"
+        docs.append({"AbsoluteMoniker": f"D:0:0:{{{g}}}|{vsproj}|{absp}||{cpp_type}",
+                     "RelativeMoniker": f"D:0:0:{{{g}}}|{vsproj}|solutionrelative:{lab.name}\\{f}||{cpp_type}"})
+        children.append({"$type": "Document", "DocumentIndex": i, "Title": f, "DocumentMoniker": absp,
+                         "RelativeDocumentMoniker": f"{lab.name}\\{f}", "ToolTip": absp, "RelativeToolTip": f"{lab.name}\\{f}",
+                         "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==", "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
+                         "WhenOpened": now, "EditorCaption": ""})
+    j = {"Version": 1, "WorkspaceRootPath": lab.win_sol + "\\", "Documents": docs,
+         "DocumentGroupContainers": [{"Orientation": 0, "VerticalTabListWidth": 256,
+                                       "DocumentGroups": [{"DockedWidth": 200, "SelectedChildIndex": 0, "Children": children}]}]}
+    return json.dumps(j, indent=2, ensure_ascii=False).replace("\n", CRLF).encode()
+
+
+def make_db(path, schema_file, rows=None):
+    if path.exists():
+        path.unlink()
+    con = sqlite3.connect(path)
+    sql = (REPO / "schema" / schema_file).read_text()
+    ps = re.search(r"page_size=(\d+)", sql)
+    if ps:
+        con.execute(f"pragma page_size={ps.group(1)}")
+    con.executescript(sql)
+    for stmt, args in (rows or []):
+        con.execute(stmt, args)
+    con.commit()
+    con.close()
+
+
+def load_gen(name):
+    """optional generators dropped into gens/<name>.py with generate(lab, dest: Path) -> None"""
+    p = REPO / "gens" / f"{name}.py"
+    if not p.exists():
+        return None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("vslab_gen_" + name, p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def refresh_cache(lab):
+    vs = lab.sol_dir / ".vs" / f"{lab.sol_name}.slnx"
+    v18 = vs / "v18"
+    (vs / "FileContentIndex").mkdir(parents=True, exist_ok=True)
+    (v18 / "ipch/AutoPCH").mkdir(parents=True, exist_ok=True)
+    data = layout_json(lab)
+    (v18 / "DocumentLayout.json").write_bytes(data)
+    (v18 / "DocumentLayout.backup.json").write_bytes(data)
+    jobs = {
+        "Browse.VC.db": lambda p: make_db(p, "Browse.VC.db.sql"),
+        "Solution.VC.db": lambda p: make_db(p, "Solution.VC.db.sql"),
+        ".suo": lambda p: p.write_bytes(b""),
+    }
+    gens = {"Browse.VC.db": "browse", "Solution.VC.db": "solution", ".suo": "suo"}
+    for fn, job in jobs.items():
+        dest = v18 / fn
+        g = load_gen(gens[fn])
+        (g.generate(lab, dest) if g else job(dest))
+    # vsidx: one per solution. Real name is a GUID VS derives internally; we derive a stable one from the solution GUID.
+    vid = str(uuid.uuid5(uuid.NAMESPACE_URL, "vslab:" + lab.guid))
+    g = load_gen("vsidx")
+    dest = vs / "FileContentIndex" / f"{vid}.vsidx"
+    (g.generate(lab, dest) if g else dest.write_bytes(b""))
+    # ipch/AutoPCH/<hash>/<SOURCE>.ipch : one per source file (names right, content empty unless a generator exists)
+    g = load_gen("ipch")
+    for s in lab.sources():
+        h = hashlib.sha1((lab.win_proj + "\\" + s).lower().encode()).hexdigest()[:16].lstrip("0") or "0"
+        d = v18 / "ipch/AutoPCH" / h
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / (Path(s).stem.upper() + ".ipch")
+        (g.generate(lab, dest) if g else dest.write_bytes(b""))
+    say("editor cache written to", vs.relative_to(lab.sol_dir))
+
+
+def cmd_cache(a):
+    refresh_cache(Lab())
+
+
+# --------------------------------------------------------------------------- zip
+UT_EXTRA = lambda mt: b"UT\x05\x00\x01" + struct.pack("<I", int(mt))
+UX_EXTRA = b"ux\x0b\x00\x01\x04\x00\x00\x00\x00\x04\x00\x00\x00\x00"
+
+
+class NoSeek(io.RawIOBase):
+    """unseekable sink: makes zipfile write data descriptors (flag bit 3), like the reference zip"""
+    def __init__(self, f):
+        self.f = f
+    def writable(self):
+        return True
+    def write(self, b):
+        return self.f.write(b)
+
+
+ZIP_EXCLUDE = {".vscode"}  # VS Code helper files are not part of a Visual Studio solution folder
+
+
+def zip_walk(root, exclude=ZIP_EXCLUDE):
+    """pre-order, case-insensitive name order, dir entry before its content (the order of the reference zip)"""
+    out = []
+    def rec(d):
+        for p in sorted(d.iterdir(), key=lambda p: p.name.lower()):
+            if p.name in exclude and d == root:
+                continue
+            out.append(p)
+            if p.is_dir() and not p.is_symlink():
+                rec(p)
+    out.append(root)
+    rec(root)
+    return out
+
+
+def cmd_zip(a):
+    lab = Lab()
+    out = Path(a.output) if a.output else lab.sol_dir.parent / (lab.sol_name[:-4] if lab.sol_name.endswith("_sol") else lab.sol_name) / "x"
+    out = Path(a.output) if a.output else lab.sol_dir.parent / f"{lab.sol_name}.zip"
+    if not (lab.sol_dir / ".vs").exists():
+        refresh_cache(lab)
+    base = lab.sol_dir.parent
+    tmp = out.with_suffix(".zip.tmp")
+    with open(tmp, "wb") as raw:
+        zf = zipfile.ZipFile(NoSeek(raw), "w", zipfile.ZIP_DEFLATED, compresslevel=6)
+        n = 0
+        for p in zip_walk(lab.sol_dir):
+            st = p.stat()
+            rel = p.relative_to(base).as_posix()
+            lt = time.localtime(st.st_mtime)
+            zi = zipfile.ZipInfo(rel + ("/" if p.is_dir() else ""), date_time=lt[:6])
+            zi.create_system = 3
+            zi.extra = UT_EXTRA(st.st_mtime) + UX_EXTRA
+            if p.is_dir():
+                zi.external_attr = 0o40777 << 16
+                zi.compress_type = zipfile.ZIP_STORED
+                zf.writestr(zi, b"")
+            else:
+                zi.external_attr = (0o100777 if p.suffix.lower() in (".exe", ".dll") else 0o100666) << 16
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                with open(p, "rb") as src, zf.open(zi, "w", force_zip64=st.st_size > 0x7FFFFFFF) as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+            n += 1
+        zf.close()
+    tmp.replace(out)
+    say(f"wrote {out} ({n} entries, {out.stat().st_size // 1024} KiB)")
+
+
+# --------------------------------------------------------------------------- check
+def load_tree(src):
+    """-> (root name, {relpath: bytes-getter}, {relpath: info}) from a zip or folder. Paths are relative to the single top folder."""
+    src = Path(src)
+    files, meta = {}, {}
+    if src.is_file() and zipfile.is_zipfile(src):
+        z = zipfile.ZipFile(src)
+        tops = {i.filename.split("/")[0] for i in z.infolist()}
+        top = tops.pop() if len(tops) == 1 else ""
+        for i in z.infolist():
+            rel = i.filename[len(top) + 1:] if top else i.filename
+            if not rel:
+                continue
+            if i.is_dir():
+                meta[rel] = i
+                files[rel] = None
+            else:
+                files[rel] = (lambda i=i: z.read(i))
+                meta[rel] = i
+        return top, files, meta, z
+    src = src.resolve()
+    for p in zip_walk(src):
+        rel = p.relative_to(src).as_posix()
+        if not rel or rel == ".":
+            continue
+        files[rel + ("/" if p.is_dir() else "")] = None if p.is_dir() else (lambda p=p: p.read_bytes())
+        meta[rel + ("/" if p.is_dir() else "")] = None
+    files = {k: v for k, v in files.items()}
+    return src.name, files, meta, None
+
+
+def fmt_family(rel, data):
+    """small structural fingerprint: are the two files the same *kind* of thing?"""
+    low = rel.lower()
+    if data[:2] == b"MZ":
+        return "pe"
+    if data[:4] == b"\xd0\xcf\x11\xe0":
+        return "ole"
+    if data[:16] == b"SQLite format 3\0":
+        return "sqlite"
+    if data[:2] == b"\xff\xfe":
+        return "utf16-text"
+    if data[:4] == b"PK\x03\x04":
+        return "zip"
+    if low.endswith((".json", ".command")):
+        try:
+            json.loads(data.decode("utf-8-sig"))
+            return "json"
+        except Exception:
+            return "other"
+    try:
+        t = data.decode("utf-8-sig")
+        if t.lstrip().startswith("<?xml") or t.lstrip().startswith("<Project"):
+            return "xml"
+        return "text"
+    except UnicodeDecodeError:
+        return "binary:" + low.rsplit(".", 1)[-1]
+
+
+def sqlite_schema(data):
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".db") as t:
+        t.write(data)
+        t.flush()
+        c = sqlite3.connect(t.name)
+        s = sorted(r[0] for r in c.execute("select sql from sqlite_master where sql is not null"))
+        c.close()
+        return s
+
+
+def cmd_check(a):
+    rt, rf, rm, rz = load_tree(a.ref)
+    ct, cf, cm, cz = load_tree(a.cand)
+    norm = (lambda s: s.lower()) if a.ignore_case else (lambda s: s)
+    # tolerate the solution folder having another name: rename the top and the .slnx/.vcxproj paths if asked
+    rmap = {norm(k): k for k in rf}
+    cmap = {norm(k): k for k in cf}
+    ident, same, diff, missing, extra = [], [], [], [], []
+    for k in sorted(rmap):
+        rk = rmap[k]
+        if rk.endswith("/"):
+            if k not in cmap:
+                missing.append((rk, "folder"))
+            continue
+        if k not in cmap:
+            missing.append((rk, "file"))
+            continue
+        ck = cmap[k]
+        rb, cb = rf[rk](), cf[ck]()
+        if hashlib.sha256(rb).digest() == hashlib.sha256(cb).digest():
+            ident.append(rk)
+            continue
+        a_, b_ = fmt_family(rk, rb), fmt_family(rk, cb)
+        note = ""
+        if a_ == b_ == "sqlite":
+            same_schema = sqlite_schema(rb) == sqlite_schema(cb)
+            note = "same schema" if same_schema else "schema differs"
+            (same if same_schema else diff).append((rk, a_, note, len(rb), len(cb)))
+        elif a_ == b_:
+            same.append((rk, a_, "", len(rb), len(cb)))
+        else:
+            diff.append((rk, f"{a_} vs {b_}", "", len(rb), len(cb)))
+    for k in sorted(cmap):
+        if k not in rmap and not cmap[k].endswith("/"):
+            extra.append(cmap[k])
+    print(f"reference: {a.ref}  ({len(rf)} entries)\ncandidate: {a.cand}  ({len(cf)} entries)\n")
+    print(f"IDENTICAL ({len(ident)}): byte for byte equal")
+    for r in ident:
+        print("   =", r)
+    print(f"\nSAME FORMAT, DIFFERENT BYTES ({len(same)}): equal kind of file, content differs (build time, paths, ids, IDE state)")
+    for r, f, n, la, lb in same:
+        print(f"   ~ {r}   [{f}{', ' + n if n else ''}]  ref {la} B, cand {lb} B")
+    print(f"\nDIFFERENT FORMAT ({len(diff)}): not the same kind of file")
+    for r, f, n, la, lb in diff:
+        print(f"   ! {r}   [{f}{', ' + n if n else ''}]  ref {la} B, cand {lb} B")
+    print(f"\nMISSING from candidate ({len(missing)})")
+    for r, k in missing:
+        print("   -", r)
+    print(f"\nEXTRA in candidate ({len(extra)})")
+    for r in extra:
+        print("   +", r)
+    if rz and cz:
+        print("\nZIP METADATA (first file entry and first folder entry)")
+        for label, z in (("ref ", rz), ("cand", cz)):
+            fi = next(i for i in z.infolist() if not i.is_dir())
+            di = next(i for i in z.infolist() if i.is_dir())
+            print(f"   {label}: file mode {oct(fi.external_attr >> 16)} create_system {fi.create_system} flags {fi.flag_bits} extra {len(fi.extra)}B | dir mode {oct(di.external_attr >> 16)}")
+    total = len(ident) + len(same) + len(diff) + len(missing)
+    print(f"\nsummary: {len(ident)} identical, {len(same)} same-format, {len(diff)} different-format, {len(missing)} missing, {len(extra)} extra (of {total} reference files)")
+    sys.exit(0 if not (missing or diff) else 1)
+
+
+# --------------------------------------------------------------------------- vscode
+def cmd_vscode(a):
+    lab = Lab()
+    d = lab.sol_dir / ".vscode"
+    d.mkdir(exist_ok=True)
+    proj = lab.proj_dir.relative_to(lab.sol_dir).as_posix()
+    srcs = " ".join(f"${{workspaceFolder}}/{proj}/{s}".replace("\\", "/") for s in lab.sources())
+    tasks = {"version": "2.0.0", "tasks": [
+        {"label": "vslab: build", "type": "shell", "command": "vslab build", "group": {"kind": "build", "isDefault": True},
+         "problemMatcher": {"owner": "msvc", "fileLocation": ["absolute"], "pattern": {
+             "regexp": "^\\s*(.+?)\\((\\d+)(?:,(\\d+))?\\):\\s+(warning|error)\\s+(\\w+\\d+):\\s+(.*)$",
+             "file": 1, "line": 2, "column": 3, "severity": 4, "code": 5, "message": 6}}},
+        {"label": "vslab: run", "type": "shell", "command": "vslab run", "dependsOn": "vslab: build",
+         "presentation": {"reveal": "always", "focus": True, "panel": "dedicated"}, "problemMatcher": []},
+        {"label": "vslab: zip", "type": "shell", "command": "vslab zip", "problemMatcher": []},
+        {"label": "native: g++ debug build", "type": "shell",
+         "command": f"mkdir -p ${{workspaceFolder}}/.vscode/native && g++ -g -O0 -std=c++20 -Wall -I${{workspaceFolder}}/{proj} {srcs} -o ${{workspaceFolder}}/.vscode/native/{lab.name}",
+         "problemMatcher": ["$gcc"], "group": "build"}]}
+    launch = {"version": "0.2.0", "configurations": [
+        {"name": "Debug with g++ (native, step through code)", "type": "cppdbg", "request": "launch",
+         "program": f"${{workspaceFolder}}/.vscode/native/{lab.name}", "args": [], "stopAtEntry": False,
+         "cwd": f"${{workspaceFolder}}/{proj}", "externalConsole": False, "MIMode": "gdb",
+         "setupCommands": [{"description": "pretty printing", "text": "-enable-pretty-printing", "ignoreFailures": True}],
+         "preLaunchTask": "native: g++ debug build"},
+        {"name": "Run the Windows exe (vslab, Wine)", "type": "node-terminal", "request": "launch", "command": "vslab run"}]}
+    (d / "tasks.json").write_text(json.dumps(tasks, indent=2) + "\n")
+    (d / "launch.json").write_text(json.dumps(launch, indent=2) + "\n")
+    (d / "extensions.json").write_text(json.dumps({"recommendations": ["ms-vscode.cpptools"]}, indent=2) + "\n")
+    say("wrote .vscode (tasks, launch, extensions). It is left out of `vslab zip` on purpose.")
+
+
+# --------------------------------------------------------------------------- doctor
+def cmd_doctor(a):
+    env = wine_env()
+    print("VSLAB_ROOT :", ROOT)
+    w = shutil.which("wine64", path=env.get("PATH")) or shutil.which("wine", path=env.get("PATH"))
+    print("wine       :", w or "MISSING")
+    print("MSVC       :", "installed" if (ROOT / "msvc/VC/Tools/MSVC").is_dir() else "not installed (run install.sh)")
+    print("MSBuild    :", "present" if (ROOT / "msvc/MSBuild").is_dir() else "not installed")
+    for t in ("msiextract", "python3", "unzip"):
+        print(f"{t:11}:", shutil.which(t, path=env.get("PATH")) or "MISSING")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="vslab", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    s = sp.add_parser("new"); s.add_argument("name"); s.add_argument("--dir"); s.set_defaults(f=cmd_new)
+    s = sp.add_parser("sync"); s.add_argument("--all", action="store_true", help="also add every .txt file as a Text item"); s.set_defaults(f=cmd_sync)
+    s = sp.add_parser("build"); s.add_argument("--msbuild", action="store_true", help="use the real MSBuild (experimental under Wine)"); s.set_defaults(f=cmd_build)
+    s = sp.add_parser("run"); s.add_argument("--debug-style", action="store_true", help="print the F5 'exited with code' message instead of Ctrl+F5's"); s.add_argument("args", nargs="*"); s.set_defaults(f=cmd_run)
+    s = sp.add_parser("cache"); s.set_defaults(f=cmd_cache)
+    s = sp.add_parser("zip"); s.add_argument("-o", "--output"); s.set_defaults(f=cmd_zip)
+    s = sp.add_parser("check"); s.add_argument("ref"); s.add_argument("cand"); s.add_argument("--ignore-case", action="store_true"); s.set_defaults(f=cmd_check)
+    s = sp.add_parser("vscode"); s.set_defaults(f=cmd_vscode)
+    s = sp.add_parser("doctor"); s.set_defaults(f=cmd_doctor)
+    a = ap.parse_args()
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
