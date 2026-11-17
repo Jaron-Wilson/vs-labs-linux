@@ -52,7 +52,7 @@ class Lab:
     # windows view of the tree (the repos symlink inside the Wine prefix points at sol_dir.parent)
     @property
     def win_repos(self):
-        return rf"C:\Users\{WINUSER}\source\repos"
+        return os.environ.get("VSLAB_WINREPOS", rf"C:\Users\{WINUSER}\source\repos").rstrip("\\")
 
     @property
     def win_sol(self):
@@ -61,6 +61,31 @@ class Lab:
     @property
     def win_proj(self):
         return rf"{self.win_sol}\{self.proj_dir.relative_to(self.sol_dir)}".replace("/", "\\")
+
+    # editor tabs: what a freshly created VS project shows is the main .cpp; `vslab tabs` records what you really have open.
+    # open = tabs open now (DocumentLayout.json, .suo); visited = every file ever opened (IntelliSense scan files and .ipch exist for those)
+    @property
+    def tabs_file(self):
+        return self.sol_dir / ".vslab" / "tabs.json"
+
+    def tabs(self):
+        exist = lambda n: (self.proj_dir / n).is_file()
+        try:
+            t = json.loads(self.tabs_file.read_text())
+            op = [n for n in t.get("open", []) if exist(n)]
+            vis = [n for n in dict.fromkeys(op + t.get("visited", [])) if exist(n)]
+            if op:
+                return op, vis
+        except (OSError, ValueError):
+            pass
+        mains = [f.name for f in sorted(self.proj_dir.iterdir()) if f.suffix.lower() in (".cpp", ".cc", ".cxx", ".c")
+                 and re.search(r"\bmain\s*\(", f.read_text(errors="ignore"))]
+        first = (mains or self.sources()[:1])[:1]
+        return first, first
+
+    def save_tabs(self, op, vis):
+        self.tabs_file.parent.mkdir(exist_ok=True)
+        self.tabs_file.write_text(json.dumps({"open": op, "visited": list(dict.fromkeys(vis + op))}, indent=1) + "\n")
 
     def sources(self):
         return [m.replace("/", "\\") for m in re.findall(r'<ClCompile Include="([^"]+)"', self.vcx)]
@@ -254,7 +279,7 @@ class Toolchain:
             path.symlink_to(target)
         sym(c / "Program Files/Microsoft Visual Studio/18/Community/VC", (self.msvc / "VC").resolve())
         sym(c / "Program Files (x86)/Windows Kits/10", (self.msvc / "Windows Kits/10").resolve())
-        sym(c / f"users/{WINUSER}/source/repos", lab.sol_dir.parent)
+        sym(c / lab.win_repos[3:].replace("\\", "/"), lab.sol_dir.parent)
         # the Debug C++ runtime (/MDd programs need it). On Windows Visual Studio puts it on the machine; here it goes into the
         # Wine system folder, never into the lab folder.
         dbg = self.msvc / "VC/Redist/MSVC" / self.vcver / "debug_nonredist/x64/Microsoft.VC145.DebugCRT"
@@ -374,6 +399,11 @@ def cmd_build(a):
         return build_msbuild(lab, tc)
     cfgdir = lab.proj_dir / "x64/Debug"
     outdir = lab.sol_dir / "x64/Debug"
+    # always a clean build ("Rebuild"): Visual Studio only recompiles what changed, which we do not track, and re-linking into old
+    # .pdb/.ilk/.idb files would make them grow differently from a clean Visual Studio build
+    shutil.rmtree(cfgdir, ignore_errors=True)
+    for stale in (outdir.glob(f"{lab.name}.*") if outdir.is_dir() else []):
+        stale.unlink()
     cfgdir.mkdir(parents=True, exist_ok=True)
     outdir.mkdir(parents=True, exist_ok=True)
     srcs = lab.sources()
@@ -407,14 +437,23 @@ def cmd_build(a):
     wpdb = rf"{wsol}\x64\Debug\{lab.name}.pdb"
     wlib = rf"{wsol}\x64\Debug\{lab.name}.lib"
     lflags = link_flags(lab, tc, wexe, wpdb, wlib, objs)
-    rc2, out2 = tc.run_in(wproj, link, [q_link(x) for x in lflags])
-    lines2 = [l for l in out2.split("\n") if l.strip()]
+    rc2, out2 = tc.run_in(wproj, link, [q_link(x) for x in lflags] + ["/VERBOSE:LIB"])
+    # /VERBOSE:LIB only serves to learn which libraries link really read (for link.read.1.tlog); it is not shown or logged
+    searched = []
+    for l in out2.split("\n"):
+        mm = re.match(r"\s+Searching (.+?):\s*$", l)
+        if mm and mm.group(1) not in searched:
+            searched.append(mm.group(1))
+    explicit = {x.lower() for x in lflags if x.lower().endswith(".lib")}
+    deflibs = [x for x in searched if Path(x.replace("\\", "/")).name.lower() not in explicit]
+    lines2 = [l for l in out2.split("\n") if l.strip() and not re.match(r"\s+(Searching|Found) |Searching libraries|Finished searching|LINK : .*performing full link", l)]
     print("\n".join(unix_display(lab, "  " + l) for l in lines2))
     if rc2 != 0:
         sys.exit("vslab: link failed")
     final = f"  {lab.name}.vcxproj -> {wexe}"
     print(final)
-    write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, objs, logl + lines2, final)
+    write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, objs, logl + lines2, final, deflibs)
+    write_dt_files(lab, tc, lab.tabs()[1])
     refresh_cache(lab)
     say(f"Build succeeded in {time.time() - t0:.1f}s")
 
@@ -439,7 +478,7 @@ def up(s):
     return s.upper()
 
 
-def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, objs, loglines, final):
+def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, objs, loglines, final, deflibs=()):
     """Write the MSBuild bookkeeping files from the commands that were really run.
     The command logs are exact; the read logs come from /showIncludes (same file set, order as cl saw it)."""
     d = lab.proj_dir / "x64/Debug"
@@ -451,10 +490,18 @@ def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, 
     wproj, wsol = lab.win_proj, lab.win_sol
     clcmd = " ".join(flags + [r'/Fo"X64\DEBUG\\"', r'/Fd"X64\DEBUG\VC145.PDB"'] + CL_TAIL)
     u16(tl / "CL.command.1.tlog", "".join(f"^{up(s)}\n{clcmd} {up(s)}\n" for s in abs_srcs))
-    read = "".join(f"^{up(s)}\n" + "\n".join(up(i) for i in dict.fromkeys(includes.get(s, []))) + "\n" for s in abs_srcs)
+    clui = rf"{tc.vc_win}\bin\Hostx64\x64\1033\clui.dll"
+    def deps(i, s):
+        lst = [up(x.replace("/", "\\")) for x in dict.fromkeys(includes.get(s, []))]
+        if i == 0:  # cl loads its resource DLL once, while processing the first file (position after <cstdint> in the reference build)
+            k = next((n for n, x in enumerate(lst) if x.endswith("\\STDINT.H")), len(lst) - 1) + 1
+            lst.insert(k, up(clui))
+        return lst
+    read = "".join(f"^{up(s)}\n" + "\n".join(deps(i, s)) + "\n" for i, s in enumerate(abs_srcs))
     u16(tl / "CL.read.1.tlog", read)
     wr = "^" + "|".join(up(s) for s in abs_srcs) + "\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n" + up(rf"{wproj}\x64\Debug\vc145.idb") + "\n" + \
          "\n".join(up(rf"{wproj}\x64\Debug\{Path(s).stem}.obj") for s in reversed(srcs)) + "\n"
+    wr += "".join(f"^{up(s)}\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n" for s in abs_srcs)
     u16(tl / "CL.write.1.tlog", wr)
     (tl / "Cl.items.tlog").write_bytes("".join(f"{a};{wproj}\\x64\\Debug\\{PureWindowsPath(r).stem}.obj\r\n" for a, r in zip(abs_srcs, srcs)).encode())
     objabs = [rf"{wproj}\x64\Debug\{Path(s).stem}.obj" for s in srcs]
@@ -471,7 +518,11 @@ def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, 
         disp.append(x)
     u16(tl / "link.command.1.tlog", f"^{jo}\n{' '.join(disp)} {up(objs[0])}\n" + "\n".join(up(o) for o in objs[1:]) + "\n")
     libs = [x for x in lflags if x.lower().endswith(".lib") and "\\" not in x and not x.startswith("/")]
-    rd = f"^{jo}\n" + "\n".join(up(rf"{tc.sdk_win}\Lib\{tc.sdkver}\um\x64\{l}") for l in libs) + "\n"
+    rd = f"^{jo}\n" + "\n".join(up(rf"{tc.sdk_win}\Lib\{tc.sdkver}\um\x64\{l}") for l in libs) + "\n" + "\n".join(up(o) for o in objabs) + "\n"
+    rd += up(rf"{tc.vc_win}\include\manifest\segmentheap.manifest") + "\n" + r"C:\WINDOWS\GLOBALIZATION\SORTING\SORTDEFAULT.NLS" + "\n"
+    rd += "".join(up(x) + "\n" for x in deflibs)
+    rd += up(rf"{tc.vc_win}\bin\Hostx64\x64\cvtres.exe") + "\n" + r"C:\WINDOWS\SYSTEM32\TZRES.DLL" + "\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n"
+    rd += "\\\\?\\" + up(rf"{tc.vc_win}\include\manifest\segmentheap.manifest") + "\n"
     u16(tl / "link.read.1.tlog", rd)
     u16(tl / "link.write.1.tlog", f"^{jo}\n{up(rf'{wsol}\x64\Debug\{lab.name}.exe')}\n{up(rf'{wsol}\x64\Debug\{lab.name}.pdb')}\n")
     (tl / "link.secondary.1.tlog").write_bytes(("^" + "|".join(up(o) for o in objabs) + f"\r\n{wproj}\\x64\\Debug\\{lab.name}.ilk\r\n").encode())
@@ -501,6 +552,49 @@ def build_msbuild(lab, tc):
     if rc == 0:
         refresh_cache(lab)
     sys.exit(rc)
+
+
+# --------------------------------------------------------------------------- IDE dependency scan files
+def dt_command(lab, tc, doc):
+    """the cl command line Visual Studio's IDE uses for its dependency scan of one open document (UTF-16 text, from the reference)"""
+    d = lab.itemdef("ClCompile")
+    f = ["/c"]
+    f += {"Level1": ["/W1"], "Level2": ["/W2"], "Level3": ["/W3"], "Level4": ["/W4"], "EnableAllWarnings": ["/Wall"], "TurnOffAllWarnings": ["/W0"]}.get(d.get("WarningLevel", "Level3"), ["/W3"])
+    f += ["/WX-"]
+    for dfn in d.get("PreprocessorDefinitions", "").split(";"):
+        if dfn and not dfn.startswith("%"):
+            f += ["/D", dfn]
+    if lab.prop("CharacterSet") == "Unicode":
+        f += ["/D", "_UNICODE", "/D", "UNICODE"]
+    f += ["/EHsc", "/MDd" if lab.prop("UseDebugLibraries") == "true" else "/MD", "/fp:precise", "/Zc:wchar_t", "/Zc:forScope"]
+    std = {"stdcpp14": "/std:c++14", "stdcpp17": "/std:c++17", "stdcpp20": "/std:c++20", "stdcpplatest": "/std:c++latest"}.get(d.get("LanguageStandard"))
+    if std:
+        f += [std]
+    if d.get("ConformanceMode", "true") == "true":
+        f += ["/permissive-"]
+    f += ['/Fo"x64\\Debug\\\\"', "/external:W3", "/Gd", "/TP", "/errorReport:prompt"]
+    mid = (REPO / "templates/dt-includes.txt").read_text().replace("@VC@", tc.vcver).replace("@SDK@", tc.sdkver)
+    stem = f"x64\\Debug\\{doc}.obj.dt"
+    return (" ".join(f) + "  " + mid + f' /BCD "{lab.win_proj}\\\\" /scanDependencies "{stem}.module.json" /sourceDependencies "{stem}.d.json"'
+            f' /D __INTELLISENSE__ "{lab.win_proj}\\{doc}"')
+
+
+def write_dt_files(lab, tc, docs):
+    """run the real cl in dependency-scan mode for each document and keep VS's file names and command files"""
+    d = lab.proj_dir / "x64/Debug"
+    cl = rf"{tc.vc_win}\bin\Hostx64\x64\cl.exe"
+    had = {n for n in ("vc140.idb", "vc140.pdb") if (lab.proj_dir / n).exists()}
+    for doc in docs:
+        cmd = dt_command(lab, tc, doc)
+        rc, out = tc.run_in(lab.win_proj, cl, [cmd])
+        stem = d / f"{doc}.obj.dt"
+        if rc != 0 or not Path(str(stem) + ".d.json").exists():
+            say(f"dependency scan of {doc} failed:", out.strip().splitlines()[-1] if out.strip() else rc)
+            continue
+        Path(str(stem) + ".module.json.command").write_bytes(b"\xff\xfe" + cmd.encode("utf-16-le"))
+    for n in ("vc140.idb", "vc140.pdb"):  # default program database cl leaves behind when run in scan mode; not part of VS output
+        if n not in had:
+            (lab.proj_dir / n).unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- run
@@ -607,6 +701,12 @@ def refresh_cache(lab, only=None):
     if only == "vsidx":
         vsidx_only(lab, vs)
         return
+    if only == "layout":
+        for n, g in (("layout", v18), ("suo", v18 / ".suo")):
+            m = load_gen(n)
+            if m:
+                m.generate(lab, g)
+        return
     gl = load_gen("layout")
     if gl:
         gl.generate(lab, v18)
@@ -640,7 +740,16 @@ def refresh_cache(lab, only=None):
     # ipch/AutoPCH/<hash>/<SOURCE>.ipch for the files open in the editor (VS makes one per parsed .cpp)
     g = load_gen("ipch")
     if g:
-        g.generate_all(lab, str(v18 / "ipch/AutoPCH"), sources_for_layout(lab))
+        cpps = [n for n in lab.tabs()[1] if n.lower().endswith((".cpp", ".cc", ".cxx", ".c"))]
+        clo, mt = None, None
+        try:
+            tc = Toolchain()
+            tc.link_prefix(lab)
+            clo = lambda src: include_closure(lab, tc, src)
+            mt = lambda wp: win_mtime(tc, wp)
+        except SystemExit:
+            say("no MSVC installed: .ipch file list uses the built-in model")
+        g.generate_all(lab, str(v18 / "ipch/AutoPCH"), cpps, clo, mt)
     say("editor cache written to", vs.relative_to(lab.sol_dir))
 
 
@@ -652,6 +761,41 @@ def vsidx_only(lab, vs):
     g = load_gen("vsidx")
     if g:
         g.generate(lab, dest)
+
+
+def include_closure(lab, tc, src):
+    """ordered, de-duplicated list of every header the real compiler reads for one source (cl /Zs /showIncludes)"""
+    cl = rf"{tc.vc_win}\bin\Hostx64\x64\cl.exe"
+    rc, out = tc.run_in(lab.win_proj, cl, [f for f in cl_flags(lab) if f not in ("/ZI", "/Zi", "/JMC")] + ["/Zs", "/showIncludes", src])
+    seen, res = set(), []
+    for line in out.split("\n"):
+        mm = re.match(r"Note: including file:\s+(.*)", line)
+        if mm:
+            p = mm.group(1).strip()
+            if p.upper() not in seen:
+                seen.add(p.upper())
+                res.append(p)
+    return res
+
+
+def win_mtime(tc, winpath):
+    """real modification time of a header of the installed toolchain, found case-insensitively"""
+    parts = winpath.split("\\")
+    if winpath.upper().startswith(r"C:\PROGRAM FILES\MICROSOFT VISUAL STUDIO\18\COMMUNITY\VC"):
+        cur, rest = tc.msvc / "VC", parts[6:]
+    elif winpath.upper().startswith(r"C:\PROGRAM FILES (X86)\WINDOWS KITS\10"):
+        cur, rest = tc.msvc / "Windows Kits/10", parts[4:]
+    else:
+        return None
+    for seg in rest:
+        nxt = cur / seg
+        if not nxt.exists():
+            m = [x for x in cur.iterdir() if x.name.lower() == seg.lower()] if cur.is_dir() else []
+            if not m:
+                return None
+            nxt = m[0]
+        cur = nxt
+    return cur.stat().st_mtime
 
 
 def cmd_seed(a):
@@ -674,6 +818,32 @@ def cmd_seed(a):
     say("seed saved:", dst / "Browse.VC.db", f"({(dst / 'Browse.VC.db').stat().st_size // 1024} KiB)")
 
 
+def cmd_tabs(a):
+    lab = Lab()
+    op, vis = lab.tabs()
+    if a.action == "list":
+        print("open tabs   :", ", ".join(op))
+        print("ever opened :", ", ".join(vis))
+        return
+    names = a.files
+    for n in names:
+        if not (lab.proj_dir / n).is_file():
+            sys.exit(f"vslab: {n} is not in the project folder")
+    if a.action == "open":
+        op = op + [n for n in names if n not in op]
+    elif a.action == "set":
+        op = names
+    elif a.action == "close":
+        op = [n for n in op if n not in names] or op
+    elif a.action == "reset":
+        lab.tabs_file.unlink(missing_ok=True)
+        say("tabs reset to the main source file")
+        return
+    lab.save_tabs(op, vis + names if a.action in ("open", "set") else vis)
+    say("open tabs:", ", ".join(lab.tabs()[0]))
+    refresh_cache(lab, only="layout")
+
+
 def cmd_cache(a):
     refresh_cache(Lab())
 
@@ -693,7 +863,7 @@ class NoSeek(io.RawIOBase):
         return self.f.write(b)
 
 
-ZIP_EXCLUDE = {".vscode"}  # VS Code helper files are not part of a Visual Studio solution folder
+ZIP_EXCLUDE = {".vscode", ".vslab"}  # VS Code helper files are not part of a Visual Studio solution folder
 
 
 def zip_walk(root, exclude=ZIP_EXCLUDE):
@@ -928,6 +1098,7 @@ def main():
     s = sp.add_parser("sync"); s.add_argument("--all", action="store_true", help="also add every .txt file as a Text item"); s.set_defaults(f=cmd_sync)
     s = sp.add_parser("build"); s.add_argument("--msbuild", action="store_true", help="use the real MSBuild (experimental under Wine)"); s.set_defaults(f=cmd_build)
     s = sp.add_parser("run"); s.add_argument("--debug-style", action="store_true", help="print the F5 'exited with code' message instead of Ctrl+F5's"); s.add_argument("args", nargs="*"); s.set_defaults(f=cmd_run)
+    s = sp.add_parser("tabs", help="which files are open in the editor (DocumentLayout.json, .suo)"); s.add_argument("action", choices=["list", "open", "close", "set", "reset"], nargs="?", default="list"); s.add_argument("files", nargs="*"); s.set_defaults(f=cmd_tabs)
     s = sp.add_parser("cache"); s.set_defaults(f=cmd_cache)
     s = sp.add_parser("seed", help="use Browse.VC.db from a real Visual Studio zip for system header rows"); s.add_argument("source"); s.set_defaults(f=cmd_seed)
     s = sp.add_parser("zip"); s.add_argument("-o", "--output"); s.set_defaults(f=cmd_zip)

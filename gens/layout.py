@@ -5,7 +5,7 @@ import gen_layout as L
 
 
 def generate(lab, v18_dir):
-    p = L.discover(str(lab.sol_dir), lab.win_repos, None)
+    p = L.discover(str(lab.sol_dir), lab.win_repos, lab.tabs()[0])
     data = L.dump_layout(L.build_layout(p))
     for n in ("DocumentLayout.json", "DocumentLayout.backup.json"):
         open(os.path.join(str(v18_dir), n), "wb").write(data)
