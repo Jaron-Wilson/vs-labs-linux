@@ -66,7 +66,7 @@ if [ ${#missing[@]} -gt 0 ]; then
     command -v apt-get >/dev/null || { echo "apt-get not found: this fallback is Debian/Ubuntu only"; exit 1; }
     mkdir -p "$ROOT/debs" "$ROOT/root"
     ( cd "$ROOT/debs"
-      pk=$(apt-get -s install --no-install-recommends -o Debug::NoLocking=1 wine64 libwine msitools 2>/dev/null | awk '/^Inst /{print $2}')
+      pk=$(apt-get -s install --no-install-recommends -o Debug::NoLocking=1 wine64 libwine msitools libz-mingw-w64 2>/dev/null | awk '/^Inst /{print $2}')
       [ -n "$pk" ] || { echo "could not resolve packages (is 'apt update' recent?)"; exit 1; }
       # shellcheck disable=SC2086
       apt-get download $pk
@@ -114,6 +114,10 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "note: add \$HOME/.local/bi
 say "msvc-wine (open source downloader/installer for Microsoft's tools)"
 [ -d "$ROOT/msvc-wine/.git" ] || git clone --depth 1 https://github.com/mstorsjo/msvc-wine "$ROOT/msvc-wine"
 [ -d "$ROOT/wineprefix" ] || { echo "creating Wine prefix"; wineboot -i >/dev/null 2>&1 || true; }
+
+# user-space Wine needs its mingw zlib inside the prefix too (found while testing: user32.dll fails to load without it)
+Z=$(find "$ROOT/root" -name zlib1.dll -path '*x86_64-windows*' 2>/dev/null | head -1 || true)
+[ -n "$Z" ] && [ -d "$ROOT/wineprefix/drive_c/windows/system32" ] && cp -n "$Z" "$ROOT/wineprefix/drive_c/windows/system32/" || true
 
 # ---------------------------------------------------------------- 3. license
 if [ -d "$ROOT/msvc/VC/Tools/MSVC" ]; then
