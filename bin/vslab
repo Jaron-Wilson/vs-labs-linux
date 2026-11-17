@@ -301,6 +301,16 @@ class Toolchain:
                 path.unlink()
             path.symlink_to(target)
         sym(c / "Program Files/Microsoft Visual Studio/18/Community/VC", (self.msvc / "VC").resolve())
+        # Wine reports a program's path with the case it has on disk, Windows with the case it was started with. MSBuild starts
+        # ...\bin\HostX64\x64\CL.exe and cl stores that spelling in every .obj and .pdb, so offer those spellings as symlinks
+        # (names only, no file is changed or copied).
+        b = self.msvc / "VC/Tools/MSVC" / self.vcver / "bin"
+        if (b / "Hostx64").is_dir() and not (b / "HostX64").exists():
+            (b / "HostX64").symlink_to("Hostx64")
+        for t in ("x64", "x86"):
+            d = b / "Hostx64" / t
+            if (d / "cl.exe").exists() and not (d / "CL.exe").exists():
+                (d / "CL.exe").symlink_to("cl.exe")
         sym(c / "Program Files (x86)/Windows Kits/10", (self.msvc / "Windows Kits/10").resolve())
         sym(c / lab.win_repos[3:].replace("\\", "/"), lab.sol_dir.parent)
         # the Debug C++ runtime (/MDd programs need it). On Windows Visual Studio puts it on the machine; here it goes into the
@@ -346,7 +356,12 @@ class Toolchain:
     def msvc_env(self):
         e = dict(self.env)
         sdk, v = self.sdk_win, self.sdkver
-        e["INCLUDE"] = ";".join([rf"{self.vc_win}\include"] + [rf"{sdk}\Include\{v}\{x}" for x in ("ucrt", "shared", "um", "winrt", "cppwinrt")])
+        # the INCLUDE and EXTERNAL_INCLUDE lists that Visual Studio's MSBuild sets (cl copies them into the -I and -external:I switches that it
+        # records in the .obj / .pdb build info, so they have to be the same as on Windows, in the same order)
+        inc = [rf"{self.vc_win}\include", rf"{self.vc_win}\atlmfc\include", r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\VS\include"]
+        inc += [rf"{sdk}\Include\{v}\{x}" for x in ("ucrt", "um", "shared", "winrt", "cppwinrt")] + [r"C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8\Include\um"]
+        e["INCLUDE"] = ";".join(inc)
+        e["EXTERNAL_INCLUDE"] = ";".join(inc)
         pl = CFG.plat
         e["LIB"] = ";".join([rf"{self.vc_win}\lib\{pl}", rf"{sdk}\Lib\{v}\ucrt\{pl}", rf"{sdk}\Lib\{v}\um\{pl}"])
         e["VSLAB_DUMMY"] = "1"
@@ -462,24 +477,32 @@ def cmd_build(a):
         sys.exit("vslab: no ClCompile items in the project (run vslab sync?)")
     wproj, wsol = lab.win_proj, lab.win_sol
     cl = rf"{tc.vc_win}\bin\Hostx64\{CFG.plat}\cl.exe"
-    link = rf"{tc.vc_win}\bin\Hostx64\{CFG.plat}\link.exe"
+    link = rf"{tc.vc_win}\bin\HostX64\{CFG.plat}\link.exe"
     flags = cl_flags(lab)
     tail = cl_tail()  # exactly what MSBuild passes
     abs_srcs = [rf"{wproj}\{s}" for s in srcs]
     t0 = time.time()
     say(f"Build started ({CFG.key}, toolset v145, MSVC {tc.vcver}, SDK {tc.sdkver}, Wine)")
-    rc, out = tc.run_in(wproj, cl, [*flags, "/showIncludes", "/errorReport:queue", *tail, *abs_srcs])
-    includes, cur, logl = {}, None, []
-    for line in out.split("\n"):
-        mm = re.match(r"Note: including file:\s+(.*)", line)
-        if mm:
-            if cur:
-                includes.setdefault(cur, []).append(mm.group(1).strip())
-            continue
-        if line.strip():
-            logl.append(line)
-            if line.strip().endswith((".cpp", ".c", ".cc", ".cxx")) and ":" not in line:
+    # The real compile runs exactly like MSBuild's: same cl path spelling, same switch order, project-relative source names, no extra switches.
+    # (cl stores its own command line in every .obj / .pdb, so anything extra here would change those files.)
+    cl_ms = cl.replace("\\Hostx64\\", "\\HostX64\\").replace("\\cl.exe", "\\CL.exe")
+    rc, out = tc.run_in(wproj, cl_ms, [*flags, *tail, "/errorReport:queue", *srcs])
+    logl = [l for l in out.split("\n") if l.strip()]
+    includes = {}
+    if rc == 0:
+        # the list of headers each file reads (for the .tlog files) comes from a second, compile-less pass (/Zs /showIncludes)
+        flg = [f for f in flags if f not in ("/ZI", "/Zi", "/JMC", "/GL")]
+        rci, outi = tc.run_in(wproj, cl, [*flg, "/Zs", "/showIncludes", *abs_srcs])
+        cur = None
+        for line in outi.split("\n"):
+            mm = re.match(r"Note: including file:\s+(.*)", line)
+            if mm:
+                if cur:
+                    includes.setdefault(cur, []).append(mm.group(1).strip())
+            elif line.strip().endswith((".cpp", ".c", ".cc", ".cxx")) and ":" not in line:
                 cur = next((s for s in abs_srcs if s.lower().endswith("\\" + line.strip().lower())), cur)
+        for n in ("vc140.idb", "vc140.pdb"):
+            (lab.proj_dir / n).unlink(missing_ok=True)
     print("\n".join(unix_display(lab, "  " + l) for l in logl))
     if rc != 0:
         sys.exit("vslab: compile failed")

@@ -81,3 +81,49 @@ That reference was written by 18.10, so its tlogs correctly keep the 18.10 style
 only when the same files are open as in the reference (`vslab tabs open Date.cpp Date.h Employee.cpp Visit.cpp`); with only the default tab the check reports them missing.
 
 Still to do after the 14.52 toolset is installed: re-run the PC against Linux comparison of `.exe`, `.obj`, `.pdb`, `.ilk` and the tlogs (expect `.lastbuildstate` and `CL.read` to match, and the `.obj` code and debug sections to match).
+
+## Round 5: same compiler on both sides (toolset 14.52.37025, VS 18.12 on the PC) (2026-11-17)
+
+Setup: the PC built a scratch copy of the lab (`C:\Users\jaron\opencode-work\r4`) with the real MSBuild of VS 18.12, all four configurations, plus a
+second Debug x64 build to measure how much the PC differs from itself. Linux built the same sources with `vslab` (14.52.37025, full compiler now installed), with
+`VSLAB_WINREPOS` set to the same Windows folder so every path in every record is the same. 141 of 141 headers read by the compiler are SHA-256 identical to the PC's.
+
+### What the comparison found and fixed
+
+The first comparison showed the `.obj` files differing in thousands of bytes (every `.debug$S` section had a type or string index 4 off), which in the previous
+round I had blamed on the compiler build. It was not: the compiler stores its own command line, the include lists and the tool path in the build info of every `.obj`/`.pdb`
+(an `S_BUILDINFO` record whose strings live in the PDB), and vslab ran cl differently from MSBuild. Now vslab runs the real compile exactly as MSBuild does:
+same switch order (`... /FC /errorReport:queue`), project-relative source names, no extra switches (the old `/showIncludes` was moved to a separate compile-less
+`/Zs` pass that only feeds `CL.read`), the same `INCLUDE` and `EXTERNAL_INCLUDE` lists (9 folders, in VS's order, including the `NETFXSDK` and `Auxiliary\VS\include` entries), and the tool path
+spelled `...\bin\HostX64\x64\CL.exe` (Wine reports a program's path in its on-disk case, so `vslab` adds two symlinks inside the toolset, `HostX64` and `CL.exe`; no file is copied or changed).
+Result: IPI stream of `vc145.pdb` byte-identical to the PC's, the project `.pdb` the same size, every x64 `.obj` identical except 20 to 26 bytes.
+
+### Results against the PC's VS 18.12 build
+
+| Item | Debug x64 | Release x64 | Debug x86 | Release x86 |
+| --- | --- | --- | --- | --- |
+| tlog files identical (of 9, incl. `.lastbuildstate`) | 9 | 9 | 9 | 7 (note 1) |
+| `.exe.recipe` | identical | identical | identical | identical |
+| `.obj` (9 files) | same size, 26 B differ | same size, 20 B differ | same size, 133 to 5,573 B differ (note 2) | same size, 22 B differ |
+| `.exe` | same size, 22 B differ | same size, 25 B differ | same size, 20,477 B differ (note 2) | same size, 26 B differ |
+| `vc145.pdb` | same size, 1,858 B differ (note 3) | same size, 1,737 B | same size, 1,858 B | same size, 1,701 B |
+| project `.pdb` | same size, 3.0 MB differ | same size | size differs (note 2) | size differs |
+| `.ilk` | 88 B smaller (note 3) | none | 665 KB smaller | none |
+
+The PC against itself (two clean builds of the same project, same path, same session type): `.obj` 26 B, `.exe` 22 B, `vc145.pdb` 36 B, project `.pdb` 1.4 MB (same size), `.ilk` 5,299 B, `vc145.idb` 354 B.
+So the 20 to 26 `.obj` bytes and 22 `.exe` bytes are exactly what Visual Studio itself changes on every build: the object time stamp, the 16 byte PDB type server GUID in `.debug$T`, the 8 byte `.chks64` value that
+covers it, and the `.exe` time stamp and PDB GUID. Those cannot be identical between any two builds, even on one Windows PC.
+
+Notes:
+1. Release x86 `CL.read` and `link.read`: `vctip.exe` and `mspdbsrv.exe` appear only for the first build of a session (measured on the PC: a fresh Debug x86 build lists both, a following one does not). vslab writes the fresh-session form.
+2. x86 builds: VS runs the 32-bit `Hostx86\x86\CL.exe`; this install has no 32-bit host tools and Wine here has no 32-bit support, so vslab runs the x64-hosted x86 cross compiler. In Debug x86 the generated code differs slightly
+(stack frames of 24 bytes in some functions, so unwind programs in `.debug$S` and call offsets in `.text`); Release x86 is not affected beyond the stamps. This is a real difference for Debug x86 and is caused by the compiler host binary, not by anything vslab sends.
+3. Local class names in some Microsoft headers carry a hash: for example `std::basic_string<...>::append::__l2::<lambda_1>@...@@`0556da7a` in the PC's `vc145.pdb` versus `` `56833cde`` here. 152 type records of `vc145.pdb` differ only in that 8 character hash. The hash depends on the
+canonical path of the source (it is stable across file times, file identity, spelling, a recreated folder, and from build to build on the PC) but is different under Wine for the same path (shown with a small test; the PC's `5780f7dd` for
+`C:\Users\jaron\opencode-work\lam` against Wine's `55afda29`). I could not find what Windows feeds into it (not the volume serial, which I tried to set), so it stays as a documented difference. It changes `vc145.pdb` by 1.8 KB, the `.ilk` size by 88 bytes, and the project `.pdb` contents. The code and data of the objects are not affected.
+
+### Project and `.vs` files against the PC
+
+The `.vs` folder, the `*.dt.*` scan files and the `.ipch` files are written by the VS IDE, which only the owner can run; the only IDE state on the PC is from 18.10 (2026-11-06). A MSBuild run does not create them, so there is no 18.12 reference for those files.
+`vslab check` against that real VS 18.10 zip (the lab built with 14.52): 40 identical, 40 same-format, 0 different-format, 0 missing, 0 extra (of 80 reference files). The 15 `dt` files now differ from the 18.10 ones only in the toolset version in their paths
+(same size, they come from the real `cl /scanDependencies` of 14.52). Project files (`.slnx`, `.vcxproj`, `.filters`, `.user`, sources), `<project>.log` and the recipe are identical.
