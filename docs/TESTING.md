@@ -50,5 +50,4 @@ same compiler (it was asked to update), the clean build comparison should be re-
 summary: 51 identical, 29 same-format, 0 different-format, 0 missing, 0 extra (of 80 reference files), same as round 2 (the `.suo` and the other IDE state were not touched by the header change).
 
 Known remaining gaps: exact servicing build of the compiler and SDK libraries (the installer channel serves the newest one), the memory image of `.ipch`, rows of Microsoft header symbols in
-`Browse.VC.db` without a seed, the IDE's own state in `.suo`. MSBuild itself does not run (no .NET in Wine). The real IntelliSense engine route is analysed in `intellisense-engine.md` and needs
-the owner's license step before anything can be tried.
+`Browse.VC.db` without a seed, the IDE's own state in `.suo`. MSBuild itself does not run (no .NET in Wine). The real IntelliSense engine route was investigated and is a dead end for now (see `intellisense-engine.md`).
