@@ -91,14 +91,14 @@ Why the `.vs` folder exists at all: Visual Studio makes it as a cache. It is not
 
 ## Toolchain revision (why `.exe`, `.obj`, `.pdb` are not byte-identical)
 
-A same-input comparison with a clean Visual Studio build of the same lab (Debug x64) shows the `.exe` has identical section layout and size
-and differs only in: the build timestamp, the PDB GUID and path, the Rich header (it stores the compiler build number), and a few import
-hints. Each `.obj` has the same size and differs in the timestamp, type-stream signature, the compiler version stamp and the file checksums
-(`.chks64`) of headers that differ between toolchain revisions. The cause is not our flags (they are identical) but that Microsoft's installer
-channel hands out the newest servicing build (compiler 19.51.36263, SDK libraries of a later refresh) while a given Windows machine may have an
-older one (the reference PC has VS 18.10.0: compiler 19.51.36257). Matching would need exactly the same servicing build; `vsdownload` can take
-an older channel manifest with `--manifest` if you have one. Headers: `install.sh` no longer runs msvc-wine's fix-up step (it lower-cases `#include`
-text and converts line ends, which changes checksums). Older installs can run `vslab repair-headers` to restore the CRLF line ends.
+A same-input comparison with a clean Visual Studio build of the same lab (Debug x64, same Windows paths) shows: all MSVC and SDK headers the lab reads are
+byte-identical to the PC's; `.text` and the other code and data sections of every `.obj` are identical; the `.exe` has the same section layout and size.
+What differs is only: build timestamps, the PDB GUID (new on every build, even between two Linux builds), and the effect of the compiler build number: the Rich
+header, CodeView type indices that are shifted by 4 between the compiler builds (so about 70 percent of per-function `.debug$S` sections and their `.chks64` checksums differ
+in `Main.obj`), and a few import hints from the SDK libraries (a different refresh). Microsoft's installer channel hands out the newest servicing build (compiler 19.51.36263) while a given Windows machine may
+have an older one (the reference PC has VS 18.10.0: 19.51.36257). Matching needs the same servicing build on both sides; `vsdownload` accepts an older channel manifest with `--manifest`
+if you have one. `install.sh` does not run msvc-wine's fix-up step (it lower-cases `#include` text and converts line ends in Microsoft's headers); older installs can run
+`vslab repair-headers` for the CRLF part, but a reinstall is the only complete fix.
 
 ## MSBuild (optional, experimental)
 

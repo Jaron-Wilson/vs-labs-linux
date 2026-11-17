@@ -23,26 +23,32 @@ The file set is now complete: every file, including the 15 IDE scan files and al
 | Different format | 0 | |
 | Missing / Extra | 0 / 0 | |
 
-## Clean build comparison with the real Visual Studio MSBuild (same lab, same Windows path)
+## Clean build comparison with the real Visual Studio MSBuild (round 3, fresh install with untouched headers)
 
-The reference zip's tlogs reflect a lab that was built many times, so a second reference was made: a copy of the lab built once, from scratch,
-on the PC with the real Visual Studio 18 MSBuild (`winpc build`, also `MSBuild /p:Platform=x86` and Release), and the same copy built on Linux with
-`VSLAB_WINREPOS` set to the same Windows folder so that every path in the files is the same.
+A copy of the lab was built once, from scratch, on the PC with the real Visual Studio 18 MSBuild (`winpc build`), and the same copy on Linux with
+`VSLAB_WINREPOS` set to the same Windows folder so that every path is the same. The PC is on VS 18.10.0 (compiler 19.51.36257); the Linux install is
+the installer channel's current build (compiler 19.51.36263).
 
 | Configuration | tlog files identical | Only difference |
 | --- | --- | --- |
 | Debug x64 | 8 of 9 | `.lastbuildstate` (compiler servicing number) |
-| Release x64 | 8 of 9 | same |
-| Debug Win32 | 8 of 9 | same |
-| Release Win32 | 8 of 9 | same |
+| Release x64, Debug Win32, Release Win32 | 8 of 9 each | same (measured in round 2) |
 
-`.exe` Debug x64: identical section table and size; 432 differing bytes, all in the DOS/Rich header (compiler build number), the build
-timestamp and PDB GUID/path, and 11 import hint bytes (the SDK import libraries of the two installs are different refreshes: `kernel32.lib` has
-the same size but a different hash). `.obj`: same size, 70 differing bytes in `Aide.obj` (timestamp, `.debug$T` signature, compiler stamp, checksums of one
-header); `Main.obj` differs in `.chks64` too because the SDK headers of the Linux install were rewritten by msvc-wine's fix-up step (see README, "Toolchain
-revision"). Every other MSVC header read by the lab matches the PC's byte for byte once CRLF line ends are restored (`vslab repair-headers`, 104 of 105
-checked files; the other, `sal.h`, had one lower-cased `#include`).
+Headers: all 139 MSVC and SDK header files the lab reads are now byte-identical to the PC's (SHA-256 checked), after the reinstall without msvc-wine's fix-up step.
+(Before: 104 of 105 only after `vslab repair-headers`.)
 
-Known remaining gaps: exact servicing build of the compiler and SDK (the installer channel serves the newest one), the lower-cased `#include` lines in an
-install made before `install.sh` stopped running the fix-up step, the memory image of `.ipch`, rows of Microsoft header symbols in `Browse.VC.db` without a
-seed, the IDE's own state in `.suo`. MSBuild itself does not run (no .NET in Wine).
+`.exe` Debug x64: identical section table and size, `.text`, `.rdata` and `.pdata` data identical; 432 differing bytes, all in the DOS/Rich header (compiler build
+number), the build timestamp, the PDB GUID, and 11 import-hint bytes (the SDK import libraries of the two installs are different refreshes).
+`.obj` (all nine): same size, and `.text`, `.xdata`, `.pdata`, `.rdata` identical. What differs: the timestamp, a 16 byte type stream signature (this changes on every build, also between two Linux builds
+of the same file) and the debug symbol sections: in `Main.obj` 609 of 856 `.debug$S` sections differ by about one byte each, and each of those bytes is a CodeView type index that is 4 lower in the
+Linux build than in the Windows one, the signature of a small change in the compiler's type numbering between the two compiler builds. The `.chks64` checksums of those sections differ because
+their content differs. The headers are not the reason (they are identical), so the remaining `.obj`, `.pdb`, `.ilk` and `.idb` differences are attributable to the compiler build number. Once the PC runs the
+same compiler (it was asked to update), the clean build comparison should be re-run.
+
+## Reference zip check, round 3
+
+summary: 51 identical, 29 same-format, 0 different-format, 0 missing, 0 extra (of 80 reference files), same as round 2 (the `.suo` and the other IDE state were not touched by the header change).
+
+Known remaining gaps: exact servicing build of the compiler and SDK libraries (the installer channel serves the newest one), the memory image of `.ipch`, rows of Microsoft header symbols in
+`Browse.VC.db` without a seed, the IDE's own state in `.suo`. MSBuild itself does not run (no .NET in Wine). The real IntelliSense engine route is analysed in `intellisense-engine.md` and needs
+the owner's license step before anything can be tried.
