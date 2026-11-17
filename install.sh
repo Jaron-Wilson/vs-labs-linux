@@ -144,7 +144,10 @@ EOF
   [ -n "$MSVC_VERSION" ] && args+=(--msvc-version "$MSVC_VERSION")
   [ -n "$SDK_VERSION" ] && args+=(--sdk-version "$SDK_VERSION")
   [ "$MSBUILD" = yes ] && args+=(--with-msbuild yes) || args+=(--with-msbuild no)
-  ( . "$ROOT/env.sh"; cd "$ROOT/msvc-wine" && python3 vsdownload.py "${args[@]}" && ./install.sh "$ROOT/msvc" )
+  # Only the downloader runs. msvc-wine's own install.sh (lower-casing, rewriting #include lines and LF conversion of Microsoft's
+  # headers, wrapper scripts) is skipped on purpose: it is for non-Wine tools, and it changes the checksums that cl stores in every
+  # .obj (.chks64). Without it the headers are exactly Microsoft's files, as on a Windows machine.
+  ( . "$ROOT/env.sh"; cd "$ROOT/msvc-wine" && python3 vsdownload.py "${args[@]}" )
   rm -rf "$ROOT/cache"
 fi
 

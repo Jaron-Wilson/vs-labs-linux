@@ -798,6 +798,24 @@ def win_mtime(tc, winpath):
     return cur.stat().st_mtime
 
 
+def cmd_repair_headers(a):
+    """msvc-wine's installer rewrites Microsoft's headers (LF line ends, lower-cased #include names) for use with non-Wine tools. That changes the
+    file checksums the compiler stores in every .obj (.chks64). This restores the CRLF line ends of the MSVC and ATL headers in place.
+    The lower-cased #include text cannot be restored; a fresh `install.sh` (which no longer runs those fix-ups) does everything."""
+    tc = Toolchain()
+    n = 0
+    for sub in ("include", "atlmfc/include"):
+        root = tc.msvc / "VC/Tools/MSVC" / tc.vcver / sub
+        for f in root.rglob("*"):
+            if f.is_symlink() or not f.is_file():
+                continue
+            d = f.read_bytes()
+            if b"\n" in d and b"\r\n" not in d and b"\0" not in d[:4096]:
+                f.write_bytes(d.replace(b"\n", b"\r\n"))
+                n += 1
+    say(f"converted {n} header files to CRLF")
+
+
 def cmd_seed(a):
     """take Browse.VC.db out of a zip/folder written by real Visual Studio 18 (yours or your teacher's) as the seed for system-header rows"""
     src = Path(a.source)
@@ -1099,6 +1117,7 @@ def main():
     s = sp.add_parser("build"); s.add_argument("--msbuild", action="store_true", help="use the real MSBuild (experimental under Wine)"); s.set_defaults(f=cmd_build)
     s = sp.add_parser("run"); s.add_argument("--debug-style", action="store_true", help="print the F5 'exited with code' message instead of Ctrl+F5's"); s.add_argument("args", nargs="*"); s.set_defaults(f=cmd_run)
     s = sp.add_parser("tabs", help="which files are open in the editor (DocumentLayout.json, .suo)"); s.add_argument("action", choices=["list", "open", "close", "set", "reset"], nargs="?", default="list"); s.add_argument("files", nargs="*"); s.set_defaults(f=cmd_tabs)
+    s = sp.add_parser("repair-headers", help="restore CRLF line ends in the MSVC headers of an older install"); s.set_defaults(f=cmd_repair_headers)
     s = sp.add_parser("cache"); s.set_defaults(f=cmd_cache)
     s = sp.add_parser("seed", help="use Browse.VC.db from a real Visual Studio zip for system header rows"); s.add_argument("source"); s.set_defaults(f=cmd_seed)
     s = sp.add_parser("zip"); s.add_argument("-o", "--output"); s.set_defaults(f=cmd_zip)
