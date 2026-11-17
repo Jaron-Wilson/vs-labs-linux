@@ -144,7 +144,7 @@ EOF
   [ -n "$MSVC_VERSION" ] && args+=(--msvc-version "$MSVC_VERSION")
   [ -n "$SDK_VERSION" ] && args+=(--sdk-version "$SDK_VERSION")
   [ "$MSBUILD" = yes ] && args+=(--with-msbuild yes) || args+=(--with-msbuild no)
-  ( cd "$ROOT/msvc-wine" && python3 vsdownload.py "${args[@]}" && ./install.sh "$ROOT/msvc" )
+  ( . "$ROOT/env.sh"; cd "$ROOT/msvc-wine" && python3 vsdownload.py "${args[@]}" && ./install.sh "$ROOT/msvc" )
   rm -rf "$ROOT/cache"
 fi
 

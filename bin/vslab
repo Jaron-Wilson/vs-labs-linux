@@ -14,7 +14,7 @@ Pure standard-library Python 3. Microsoft binaries are never bundled: install.sh
 from Microsoft after the user accepts the license.
 """
 import argparse, hashlib, io, json, os, re, shutil, sqlite3, struct, subprocess, sys, time, uuid, zipfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 REPO = Path(__file__).resolve().parent.parent
 ROOT = Path(os.environ.get("VSLAB_ROOT", Path.home() / ".local/share/vslab"))
@@ -213,8 +213,9 @@ def wine_env():
 
 def wine_bin(env):
     for n in ("wine64", "wine"):
-        if shutil.which(n, path=env.get("PATH")):
-            return n
+        w = shutil.which(n, path=env.get("PATH"))
+        if w:
+            return w
     sys.exit("vslab: wine not found (run install.sh)")
 
 
@@ -224,12 +225,20 @@ class Toolchain:
         if not (self.msvc / "VC/Tools/MSVC").is_dir():
             sys.exit(f"vslab: MSVC is not installed in {self.msvc}. Run install.sh (it shows Microsoft's license and asks for your yes).")
         vers = sorted(p.name for p in (self.msvc / "VC/Tools/MSVC").iterdir() if (p / "bin").is_dir())
-        self.vcver = vers[-1]
+        want = os.environ.get("VSLAB_MSVC", "14.51")  # his PC builds with 14.51.36231
+        pick = [v for v in vers if v.startswith(want)]
+        self.vcver = pick[-1] if pick else vers[-1]
         kits = self.msvc / "Windows Kits/10"
         self.sdkver = sorted(p.name for p in (kits / "Include").iterdir() if p.name[0].isdigit())[-1]
         self.env = wine_env()
         self.wine = wine_bin(self.env)
         self.prefix = Path(self.env["WINEPREFIX"])
+        # some Wine builds cannot start their server on demand; start it ourselves (it exits 60 s after the last use)
+        ws = self.env.get("WINESERVER") or shutil.which("wineserver", path=self.env.get("PATH"))
+        if ws:
+            subprocess.Popen([ws, "-p60"], env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(0.5)
 
     def link_prefix(self, lab):
         """make the Windows paths of the real PC exist inside the prefix:
@@ -246,6 +255,28 @@ class Toolchain:
         sym(c / "Program Files/Microsoft Visual Studio/18/Community/VC", (self.msvc / "VC").resolve())
         sym(c / "Program Files (x86)/Windows Kits/10", (self.msvc / "Windows Kits/10").resolve())
         sym(c / f"users/{WINUSER}/source/repos", lab.sol_dir.parent)
+        # the Debug C++ runtime (/MDd programs need it). On Windows Visual Studio puts it on the machine; here it goes into the
+        # Wine system folder, never into the lab folder.
+        dbg = self.msvc / "VC/Redist/MSVC" / self.vcver / "debug_nonredist/x64/Microsoft.VC145.DebugCRT"
+        for dll in ("msvcp140d.dll", "vcruntime140d.dll", "vcruntime140_1d.dll"):
+            if (dbg / dll).exists():
+                sym(c / "windows/system32" / dll, (dbg / dll).resolve())
+        ucrt = self.msvc / "Windows Kits/10/bin" / self.sdkver / "x64/ucrt/ucrtbased.dll"
+        if ucrt.exists():
+            sym(c / "windows/system32/ucrtbased.dll", ucrt.resolve())
+
+    def servicing(self):
+        """VCServicingVersion* values as MSBuild writes them to .lastbuildstate (read from the toolset's own props file)"""
+        out = ""
+        for k in ("ATL", "CrtHeaders", "Compilers"):
+            try:
+                t = (self.msvc / "VC/Tools/MSVC" / self.vcver / f"Auxiliary/Microsoft.VC.ServicingVersion.{k}.props").read_text(errors="ignore")
+                m = re.search(rf"<VCServicingVersion{k}[^>]*>\s*([\d.]+)\s*<", t)
+                if m:
+                    out += f"VCServicingVersion{k}={m.group(1)}:"
+            except OSError:
+                pass
+        return out
 
     @property
     def vc_win(self):
@@ -262,6 +293,15 @@ class Toolchain:
         e["LIB"] = ";".join([rf"{self.vc_win}\lib\x64", rf"{sdk}\Lib\{v}\ucrt\x64", rf"{sdk}\Lib\{v}\um\x64"])
         e["VSLAB_DUMMY"] = "1"
         return e
+
+    def run_in(self, wincwd, exe, args):
+        """run `exe args...` from the Windows folder wincwd (a C: path) through a .bat so the process really sees C: paths.
+        Arguments are written exactly as given (quote them yourself)."""
+        bat = self.prefix / "drive_c" / "vslab-run.bat"
+        bat.write_bytes(("@echo off\r\nset \"PATH=%%PATH%%;%s\\bin\\%s\\x64;%s\\bin\\Hostx64\\x64\"\r\ncd /d \"%s\"\r\n\"%s\" %s\r\nexit /b %%errorlevel%%\r\n" % (self.sdk_win, self.sdkver, self.vc_win, wincwd, exe, " ".join(args))).encode())
+        p = subprocess.run([self.wine, "cmd", "/c", r"C:\vslab-run.bat"], env=self.msvc_env(), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout.decode("utf-8", "replace").replace("\r\n", "\n")
 
     def run(self, args, cwd, echo_filter=None):
         """run a Windows program under wine, return (rc, stdout text)"""
@@ -343,11 +383,11 @@ def cmd_build(a):
     cl = rf"{tc.vc_win}\bin\Hostx64\x64\cl.exe"
     link = rf"{tc.vc_win}\bin\Hostx64\x64\link.exe"
     flags = cl_flags(lab)
-    tail = ["/Fox64\\Debug\\", "/Fdx64\\Debug\\vc145.pdb"] + CL_TAIL  # same as MSBuild's /Fo"x64\Debug\\" /Fd"..."
+    tail = [r'/Fo"x64\Debug\\"', r'/Fd"x64\Debug\vc145.pdb"'] + CL_TAIL  # exactly what MSBuild passes
     abs_srcs = [rf"{wproj}\{s}" for s in srcs]
     t0 = time.time()
     say(f"Build started (Debug|x64, toolset v145, MSVC {tc.vcver}, SDK {tc.sdkver}, Wine)")
-    rc, out = tc.run([cl, *flags, "/showIncludes", "/errorReport:queue", *tail, *abs_srcs], cfgdir)
+    rc, out = tc.run_in(wproj, cl, [*flags, "/showIncludes", "/errorReport:queue", *tail, *abs_srcs])
     includes, cur, logl = {}, None, []
     for line in out.split("\n"):
         mm = re.match(r"Note: including file:\s+(.*)", line)
@@ -367,7 +407,7 @@ def cmd_build(a):
     wpdb = rf"{wsol}\x64\Debug\{lab.name}.pdb"
     wlib = rf"{wsol}\x64\Debug\{lab.name}.lib"
     lflags = link_flags(lab, tc, wexe, wpdb, wlib, objs)
-    rc2, out2 = tc.run([link, *lflags], lab.proj_dir)
+    rc2, out2 = tc.run_in(wproj, link, [q_link(x) for x in lflags])
     lines2 = [l for l in out2.split("\n") if l.strip()]
     print("\n".join(unix_display(lab, "  " + l) for l in lines2))
     if rc2 != 0:
@@ -383,6 +423,16 @@ def unix_display(lab, line):
     """show Windows paths in compiler messages as real Linux paths so terminals and VS Code can click them"""
     pre = lab.win_repos
     return re.sub(re.escape(pre) + r"\\[^\s(:]*", lambda m: str(lab.sol_dir.parent) + m.group(0)[len(pre):].replace("\\", "/"), line)
+
+
+def q_link(x):
+    """quote a link switch like MSBuild does"""
+    if re.match(r"/(OUT|ILK|PDB|IMPLIB|manifestinput):", x):
+        k, v = x.split(":", 1)
+        return f'{k}:"{v}"'
+    if x.startswith("/MANIFESTUAC:"):
+        return '/MANIFESTUAC:"' + x.split(":", 1)[1] + '"'
+    return x
 
 
 def up(s):
@@ -406,7 +456,7 @@ def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, 
     wr = "^" + "|".join(up(s) for s in abs_srcs) + "\n" + up(rf"{wproj}\x64\Debug\vc145.pdb") + "\n" + up(rf"{wproj}\x64\Debug\vc145.idb") + "\n" + \
          "\n".join(up(rf"{wproj}\x64\Debug\{Path(s).stem}.obj") for s in reversed(srcs)) + "\n"
     u16(tl / "CL.write.1.tlog", wr)
-    (tl / "Cl.items.tlog").write_bytes("".join(f"{s};{rf'{wproj}\x64\Debug\{Path(s).stem}.obj'}\r\n" for s in abs_srcs).encode())
+    (tl / "Cl.items.tlog").write_bytes("".join(f"{a};{wproj}\\x64\\Debug\\{PureWindowsPath(r).stem}.obj\r\n" for a, r in zip(abs_srcs, srcs)).encode())
     objabs = [rf"{wproj}\x64\Debug\{Path(s).stem}.obj" for s in srcs]
     jo = "|".join(up(o) for o in objabs)
     disp = []
@@ -424,9 +474,9 @@ def write_build_records(lab, tc, srcs, abs_srcs, includes, flags, tail, lflags, 
     rd = f"^{jo}\n" + "\n".join(up(rf"{tc.sdk_win}\Lib\{tc.sdkver}\um\x64\{l}") for l in libs) + "\n"
     u16(tl / "link.read.1.tlog", rd)
     u16(tl / "link.write.1.tlog", f"^{jo}\n{up(rf'{wsol}\x64\Debug\{lab.name}.exe')}\n{up(rf'{wsol}\x64\Debug\{lab.name}.pdb')}\n")
-    (tl / "link.secondary.1.tlog").write_bytes(("^" + "\r\n".join(up(o) for o in objabs) + f"\r\n{wproj}\\x64\\Debug\\{lab.name}.ilk\r\n").encode())
+    (tl / "link.secondary.1.tlog").write_bytes(("^" + "|".join(up(o) for o in objabs) + f"\r\n{wproj}\\x64\\Debug\\{lab.name}.ilk\r\n").encode())
     (tl / f"{lab.name}.lastbuildstate").write_bytes(
-        (f"PlatformToolSet=v145:VCToolArchitecture=Native64Bit:VCToolsVersion={tc.vcver}:TargetPlatformVersion={tc.sdkver}:\r\n"
+        (f"PlatformToolSet=v145:VCToolArchitecture=Native64Bit:VCToolsVersion={tc.vcver}:{tc.servicing()}TargetPlatformVersion={tc.sdkver}:\r\n"
          f"Debug|x64|{wsol}\\|\r\n").encode())
     (d / f"{lab.name}.exe.recipe").write_bytes(("\ufeff" + CRLF.join([
         '<?xml version="1.0" encoding="utf-8"?>', "<Project>", "  <ProjectOutputs>", "    <ProjectOutput>",
@@ -557,9 +607,13 @@ def refresh_cache(lab, only=None):
     if only == "vsidx":
         vsidx_only(lab, vs)
         return
-    data = layout_json(lab)
-    (v18 / "DocumentLayout.json").write_bytes(data)
-    (v18 / "DocumentLayout.backup.json").write_bytes(data)
+    gl = load_gen("layout")
+    if gl:
+        gl.generate(lab, v18)
+    else:
+        data = layout_json(lab)
+        (v18 / "DocumentLayout.json").write_bytes(data)
+        (v18 / "DocumentLayout.backup.json").write_bytes(data)
     jobs = {
         "Browse.VC.db": lambda p: make_db(p, "Browse.VC.db.sql"),
         "Solution.VC.db": lambda p: make_db(p, "Solution.VC.db.sql"),
