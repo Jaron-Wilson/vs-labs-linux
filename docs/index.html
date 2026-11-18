@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vs-labs-linux — Visual Studio C++ labs on Linux</title>
+<meta name="description" content="Do your Visual Studio C++ labs on Linux and still hand in a normal Visual Studio solution zip. Builds with Microsoft's real MSVC compiler under Wine. No dual boot, no Windows VM.">
+<meta property="og:title" content="vs-labs-linux — Visual Studio C++ labs on Linux">
+<meta property="og:description" content="Write code in VS Code on Linux, build with the real MSVC compiler under Wine, and submit a genuine Visual Studio solution zip. No dual boot, no VM.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://vslabs.jaronwilson.dev">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128187;</text></svg>">
+<style>
+  :root{
+    --bg:#0b0f17; --bg2:#0f1524; --card:#131b2e; --line:#1f2a44;
+    --ink:#e8edf6; --muted:#9aa7bd; --dim:#6b7892;
+    --accent:#5b9dff; --accent2:#7ee0c0; --warn:#ffcf6b;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:radial-gradient(1200px 700px at 70% -10%,#16213c 0%,var(--bg) 55%);color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:960px;margin:0 auto;padding:0 20px}
+  header.nav{display:flex;align-items:center;justify-content:space-between;padding:20px 0}
+  .brand{font-family:var(--mono);font-weight:600;font-size:15px;color:var(--ink)}
+  .brand .dot{color:var(--accent2)}
+  .nav a{color:var(--muted);font-size:14px;margin-left:18px}
+
+  .hero{padding:48px 0 28px;text-align:center}
+  .pill{display:inline-block;font-family:var(--mono);font-size:12px;color:var(--accent2);border:1px solid var(--line);background:var(--bg2);padding:5px 12px;border-radius:999px;margin-bottom:22px}
+  h1{font-size:clamp(30px,6vw,52px);line-height:1.1;margin:.2em 0;letter-spacing:-.02em}
+  h1 .grad{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{font-size:clamp(16px,2.4vw,20px);color:var(--muted);max-width:640px;margin:14px auto 0}
+  .cta{margin:30px 0 8px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+  .btn{font-family:var(--sans);font-size:15px;font-weight:600;padding:12px 22px;border-radius:10px;border:1px solid var(--line);cursor:pointer;display:inline-flex;align-items:center;gap:8px}
+  .btn.primary{background:linear-gradient(90deg,var(--accent),#4b7fe0);color:#fff;border-color:transparent}
+  .btn.ghost{background:var(--card);color:var(--ink)}
+  .btn:hover{text-decoration:none;filter:brightness(1.08)}
+
+  .term{max-width:720px;margin:34px auto 0;background:#0a0e18;border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:0 30px 60px -30px #000;text-align:left}
+  .term .bar{display:flex;gap:7px;align-items:center;padding:11px 14px;background:#0d1322;border-bottom:1px solid var(--line)}
+  .term .bar i{width:11px;height:11px;border-radius:50%;display:inline-block}
+  .term .bar .r{background:#ff5f56}.term .bar .y{background:#ffbd2e}.term .bar .g{background:#27c93f}
+  .term .bar span{margin-left:10px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .term pre{margin:0;padding:18px 18px 22px;font-family:var(--mono);font-size:13.5px;line-height:1.75;overflow-x:auto;color:#cdd6ea}
+  .term .p{color:var(--accent2)}.term .c{color:var(--dim)}.term .k{color:var(--accent)}.term .o{color:var(--muted)}
+
+  section{padding:40px 0;border-top:1px solid var(--line)}
+  h2{font-size:clamp(22px,3.4vw,30px);letter-spacing:-.01em;margin:0 0 6px}
+  .lead{color:var(--muted);margin:0 0 26px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px}
+  .card h3{margin:0 0 8px;font-size:17px}
+  .card p{margin:0;color:var(--muted);font-size:14.5px}
+  .num{font-family:var(--mono);color:var(--accent2);font-size:13px}
+
+  table{width:100%;border-collapse:collapse;font-size:14.5px;margin-top:8px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.04em}
+  td code{font-family:var(--mono);font-size:13px;color:var(--accent2)}
+
+  .note{background:var(--bg2);border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:10px;padding:16px 18px;color:var(--muted);font-size:14.5px}
+  .note b{color:var(--ink)}
+
+  .help{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-top:8px}
+  .help a{display:block;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .help a:hover{text-decoration:none;border-color:var(--accent)}
+  .help h3{margin:0 0 4px;font-size:16px;color:var(--ink)}
+  .help p{margin:0;color:var(--muted);font-size:13.5px}
+
+  footer{padding:36px 0 56px;color:var(--dim);font-size:13.5px;border-top:1px solid var(--line);text-align:center}
+  footer a{color:var(--muted)}
+  .copy{font-family:var(--mono)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="nav">
+    <div class="brand">vs-labs-linux<span class="dot">_</span></div>
+    <nav>
+      <a href="#how">How it works</a>
+      <a href="#install">Install</a>
+      <a href="#help">Contribute</a>
+      <a href="https://github.com/Jaron-Wilson/vs-labs-linux">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="hero" style="border:0;padding-top:40px">
+    <div class="pill">Open source &middot; MIT &middot; tested on Ubuntu 24.04</div>
+    <h1>Visual Studio C++ labs,<br><span class="grad">done on Linux.</span></h1>
+    <p class="sub">Write code in VS Code (or any editor) on Linux and still hand in a normal Visual Studio solution zip. It builds with Microsoft's real compiler under Wine. No dual boot, no Windows VM, no lab computer.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/Jaron-Wilson/vs-labs-linux">View on GitHub</a>
+      <a class="btn ghost" href="#install">Get started</a>
+    </div>
+
+    <div class="term">
+      <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>~/cs-labs</span></div>
+<pre><span class="c"># create a project exactly like File &gt; New &gt; Project</span>
+<span class="p">$</span> <span class="k">vslab</span> new LabPointers_WilsonJ
+<span class="p">$</span> <span class="k">cd</span> LabPointers_WilsonJ_sol
+
+<span class="c"># build with the real MSVC cl/link, then run like Ctrl+F5</span>
+<span class="p">$</span> <span class="k">vslab</span> build        <span class="o"># Debug|x64, writes x64\Debug, .tlog, .vcxproj</span>
+<span class="p">$</span> <span class="k">vslab</span> run
+
+<span class="c"># zip the solution the same way Visual Studio does, ready to submit</span>
+<span class="p">$</span> <span class="k">vslab</span> zip         <span class="o"># LabPointers_WilsonJ_sol.zip</span>
+</pre>
+    </div>
+  </section>
+
+  <section id="how">
+    <h2>How it works</h2>
+    <p class="lead">Genuine Microsoft output where it counts, regenerated to match where it does not, and it tells you which is which.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="num">01</div>
+        <h3>Real MSVC, under Wine</h3>
+        <p>Builds with Microsoft's actual compiler and linker (<code>cl</code> and <code>link</code>) run under Wine, so the exe and build output are genuine, not a GCC stand-in.</p>
+      </div>
+      <div class="card">
+        <div class="num">02</div>
+        <h3>Real project files</h3>
+        <p>Writes the same files Visual Studio writes: <code>.sln</code>, <code>.vcxproj</code>, and filters. Open the result in Visual Studio and it just loads.</p>
+      </div>
+      <div class="card">
+        <div class="num">03</div>
+        <h3>A submit-ready zip</h3>
+        <p>Zips the solution folder the same layout Visual Studio produces, so your submission looks exactly like it came from Windows.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p class="lead">Ubuntu 24.04, about 6 GB free. The installer fetches Microsoft's toolchain straight from Microsoft after you accept their license. This project ships no Microsoft binaries.</p>
+    <div class="term">
+      <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>install</span></div>
+<pre><span class="p">$</span> <span class="k">git</span> clone https://github.com/Jaron-Wilson/vs-labs-linux ~/vs-labs-linux
+<span class="p">$</span> <span class="k">cd</span> ~/vs-labs-linux
+<span class="p">$</span> ./install.sh      <span class="o"># checks deps, shows the MS license, asks you to type: yes</span>
+<span class="p">$</span> <span class="k">vslab</span> doctor      <span class="o"># confirm everything is in place</span>
+</pre>
+    </div>
+    <table>
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>vslab new NAME</code></td><td>Creates a solution folder like File &gt; New &gt; Project (Console App)</td></tr>
+      <tr><td><code>vslab sync</code></td><td>Picks up new .cpp/.h files, like Add Existing Item</td></tr>
+      <tr><td><code>vslab build</code></td><td>Builds Debug|x64 with the real cl/link</td></tr>
+      <tr><td><code>vslab run</code></td><td>Runs the exe like Ctrl+F5</td></tr>
+      <tr><td><code>vslab zip</code></td><td>Produces the submit-ready solution zip</td></tr>
+      <tr><td><code>vslab check REF.zip MY.zip</code></td><td>Compares your zip against a reference, file by file</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Honest about what is exact</h2>
+    <div class="note">
+      <b>Transparency by design.</b> The README documents exactly what is genuine Microsoft output and what is regenerated to match, so anyone, including a professor, can verify it. The compiled program and build artifacts come from Microsoft's real toolchain; the surrounding project scaffolding is written to match Visual Studio's format.
+    </div>
+  </section>
+
+  <section id="help">
+    <h2>Contribute &amp; get help</h2>
+    <p class="lead">Built and tested on Ubuntu 24.04. Other distributions are untested, and that is exactly where help is welcome. If something breaks, the issue form asks for your distro, where it failed, and your <code>vslab doctor</code> output.</p>
+    <div class="help">
+      <a href="https://github.com/Jaron-Wilson/vs-labs-linux/issues/new/choose">
+        <h3>Report a problem</h3>
+        <p>Short bug form, tell me what broke on your distro.</p>
+      </a>
+      <a href="https://github.com/Jaron-Wilson/vs-labs-linux/discussions">
+        <h3>Ask a question</h3>
+        <p>Discussions: Q&amp;A, ideas, show and tell.</p>
+      </a>
+      <a href="https://github.com/Jaron-Wilson/vs-labs-linux/fork">
+        <h3>Fork and improve</h3>
+        <p>MIT licensed. Fork it, fix it, open a pull request.</p>
+      </a>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <p class="copy">vs-labs-linux &middot; MIT License &middot; built by <a href="https://jaronwilson.dev">Jaron Wilson</a></p>
+    <p>Not affiliated with or endorsed by Microsoft. Visual Studio and MSVC are trademarks of Microsoft. This project redistributes no Microsoft binaries.</p>
+  </div>
+</footer>
+</body>
+</html>
