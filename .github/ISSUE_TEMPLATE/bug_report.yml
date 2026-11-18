@@ -1,0 +1,53 @@
+name: Something does not work
+description: Install, build or zip problems with vslab
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying vs-labs-linux. The details below let us reproduce the problem.
+        Please remove anything private (names, paths with your username are fine to keep or blank out).
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution and version
+      placeholder: Ubuntu 24.04, Fedora 41, Arch, ...
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where did it fail?
+      options:
+        - install.sh
+        - vslab build / run
+        - the solution zip
+        - the project files Visual Studio opens
+        - something else
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ./install.sh
+        2. vslab new Lab3
+        3. ...
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `vslab doctor`
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: Error output or install log
+      description: Paste the end of the output where it failed.
+      render: text

@@ -14,6 +14,13 @@ Status: Ubuntu 24.04 is the target. See the "What is exact" table for what is ge
 - sudo once, for `apt` (or no sudo at all: the installer can unpack the packages in your home folder)
 - Your agreement to Microsoft's Visual Studio license (the installer shows it and asks you to type `yes`)
 
+
+## Reporting a problem
+
+Open an issue: https://github.com/Jaron-Wilson/vs-labs-linux/issues/new/choose . The form asks for your distribution,
+where it failed, the output of `vslab doctor` and the error output. Reports from distributions other than Ubuntu 24.04
+are especially welcome, since those are untested.
+
 ## Install
 
 ```bash
