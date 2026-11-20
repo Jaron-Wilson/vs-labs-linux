@@ -6,7 +6,9 @@
   vslab build                 build Debug|x64 with the real Microsoft toolchain under Wine
   vslab run                   run the exe the way Visual Studio's Ctrl+F5 does
   vslab cache                 (re)create the .vs editor-cache folder
-  vslab zip [-o FILE]         zip the solution folder with the same layout/metadata as the reference zip
+  vslab zip [-o FILE] [--clean] [--flat] [--base-len N]
+                              zip the solution folder with the same layout/metadata as the reference zip;
+                              warns when the unzipped paths could pass the Windows 260 character limit
   vslab check REF CAND        compare two zips/folders file by file
   vslab doctor                show what is installed
 
@@ -1011,12 +1013,15 @@ class NoSeek(io.RawIOBase):
 ZIP_EXCLUDE = {".vscode", ".vslab"}  # VS Code helper files are not part of a Visual Studio solution folder
 
 
-def zip_walk(root, exclude=ZIP_EXCLUDE):
-    """pre-order, case-insensitive name order, dir entry before its content (the order of the reference zip)"""
+def zip_walk(root, exclude=ZIP_EXCLUDE, clean_dirs=None):
+    """pre-order, case-insensitive name order, dir entry before its content (the order of the reference zip).
+    clean_dirs: folders (the solution and project folder) in which the build/cache folders CLEAN_DIRS are left out"""
     out = []
     def rec(d):
         for p in sorted(d.iterdir(), key=lambda p: p.name.lower()):
             if p.name in exclude and d == root:
+                continue
+            if clean_dirs and d in clean_dirs and p.name in CLEAN_DIRS and p.is_dir():
                 continue
             out.append(p)
             if p.is_dir() and not p.is_symlink():
@@ -1024,6 +1029,55 @@ def zip_walk(root, exclude=ZIP_EXCLUDE):
     out.append(root)
     rec(root)
     return out
+
+
+# Windows MAX_PATH is 260 characters including the terminating NUL, so a path of 260 or more characters fails in MSBuild.
+MAX_PATH = 260
+NEAR_MAX_PATH = 240       # "close" note
+EXTRACT_BASE_LEN = 150    # assumed length of the folder the zip is extracted into (no trailing backslash), --base-len changes it
+CLEAN_DIRS = {".vs", "x64", "Debug", "Release", "ARM64"}   # build output and editor cache folders; .vcxproj.user is kept
+
+
+def tlog_dir_name(name, guid):
+    """Folder MSBuild writes the .tlog files to. Observed with a real Visual Studio 18 zip: a long project name is cut to 8
+    characters plus the first 8 characters of the project GUID (LabPolyM.af636384.tlog). Assumption: the cut applies when the
+    project name is longer than 16 characters; shorter names keep the plain <name>.tlog form."""
+    if len(name) > 16:
+        return f"{name[:8]}.{guid.strip('{}').split('-')[0].lower()}.tlog"
+    return f"{name}.tlog"
+
+
+def build_created_entries(name, guid, proj_prefix, rel="x64/Debug"):
+    """zip style entry names of the files a build creates in the project folder, whether or not they are in the zip"""
+    d = f"{proj_prefix}{rel}/"
+    return [f"{d}{tlog_dir_name(name, guid)}/{name}.lastbuildstate", f"{d}{name}.vcxproj.FileListAbsolute.txt"]
+
+
+def longest_extracted_path(entries, zip_stem, extra_entries=(), base_len=EXTRACT_BASE_LEN):
+    """worst case Windows path length after the user runs Extract All: <base>\\<zip stem>\\<entry with backslashes>.
+    -> (length, path text with the base shown as '...')"""
+    best = (0, "")
+    for e in [*entries, *extra_entries]:
+        tail = e.rstrip("/").replace("/", "\\")
+        n = base_len + 1 + len(zip_stem) + 1 + len(tail)
+        if n > best[0]:
+            best = (n, f"...\\{zip_stem}\\{tail}")
+    return best
+
+
+def path_length_warning(length, longest, base_len=EXTRACT_BASE_LEN):
+    """-> warning text, or None when the longest path is comfortably short"""
+    if length < NEAR_MAX_PATH + 1:
+        return None
+    if length >= MAX_PATH:
+        head = (f"the longest path is {length} characters, but Windows stops at {MAX_PATH - 1} (MAX_PATH). Building the unzipped "
+                f"lab can fail with MSB3501 / \"Could not find a part of the path\".")
+    else:
+        head = f"the longest path is {length} characters, close to the Windows limit of {MAX_PATH - 1} (MAX_PATH)."
+    return (f"WARNING: {head}\n"
+            f"  longest: {longest}\n"
+            f"  (assumes the zip is extracted into a {base_len} character folder with Extract All, which adds a folder named after the zip)\n"
+            f"  Safe submission option: vslab zip --clean --flat   (no .vs/x64/Debug/Release folders, no top folder)")
 
 
 def cmd_zip(a):
@@ -1034,14 +1088,18 @@ def cmd_zip(a):
         refresh_cache(lab)
     else:
         refresh_cache(lab, only="vsidx")  # index records the sources' current modification times
-    base = lab.sol_dir.parent
+    base = lab.sol_dir if a.flat else lab.sol_dir.parent
     tmp = out.with_suffix(".zip.tmp")
+    names = []
     with open(tmp, "wb") as raw:
         zf = zipfile.ZipFile(NoSeek(raw), "w", zipfile.ZIP_DEFLATED, compresslevel=6)
         n = 0
-        for p in zip_walk(lab.sol_dir):
+        for p in zip_walk(lab.sol_dir, clean_dirs=(lab.sol_dir, lab.proj_dir) if a.clean else None):
+            if a.flat and p == lab.sol_dir:
+                continue  # the solution folder itself is not an entry when the zip has no top folder
             st = p.stat()
             rel = p.relative_to(base).as_posix()
+            names.append(rel)
             lt = time.localtime(st.st_mtime)
             zi = zipfile.ZipInfo(rel + ("/" if p.is_dir() else ""), date_time=lt[:6])
             zi.create_system = 3
@@ -1059,6 +1117,12 @@ def cmd_zip(a):
         zf.close()
     tmp.replace(out)
     say(f"wrote {out} ({n} entries, {out.stat().st_size // 1024} KiB)")
+    pdir = lab.proj_dir.relative_to(lab.sol_dir).as_posix()
+    pre = ("" if a.flat else lab.sol_dir.name + "/") + ("" if pdir == "." else pdir + "/")
+    length, longest = longest_extracted_path(names, out.stem, build_created_entries(lab.name, lab.guid, pre), a.base_len)
+    warn = path_length_warning(length, longest, a.base_len)
+    if warn:
+        print("vslab: " + warn, file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------------- check
@@ -1269,7 +1333,13 @@ def main():
     s = sp.add_parser("repair-headers", help="restore CRLF line ends in the MSVC headers of an older install"); s.set_defaults(f=cmd_repair_headers)
     s = sp.add_parser("cache"); s.set_defaults(f=cmd_cache)
     s = sp.add_parser("seed", help="use Browse.VC.db from a real Visual Studio zip for system header rows"); s.add_argument("source"); s.set_defaults(f=cmd_seed)
-    s = sp.add_parser("zip"); s.add_argument("-o", "--output"); s.set_defaults(f=cmd_zip)
+    s = sp.add_parser("zip", help="zip the solution folder; warns about Windows path length")
+    s.add_argument("-o", "--output")
+    s.add_argument("--clean", action="store_true", help="leave out the .vs, x64, Debug, Release and ARM64 folders (build output and editor cache)")
+    s.add_argument("--flat", action="store_true", help="no top folder: the .slnx is at the root of the zip")
+    s.add_argument("--base-len", type=int, default=EXTRACT_BASE_LEN, metavar="N",
+                   help=f"assumed length of the folder the zip will be extracted into (default {EXTRACT_BASE_LEN}), used for the path length warning")
+    s.set_defaults(f=cmd_zip)
     s = sp.add_parser("check"); s.add_argument("ref"); s.add_argument("cand"); s.add_argument("--ignore-case", action="store_true"); s.set_defaults(f=cmd_check)
     s = sp.add_parser("vscode"); s.set_defaults(f=cmd_vscode)
     s = sp.add_parser("doctor"); s.set_defaults(f=cmd_doctor)
