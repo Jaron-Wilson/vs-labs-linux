@@ -51,6 +51,7 @@ vslab sync                        # after you add .cpp/.h files (like Add Existi
 vslab build                       # Debug|x64 with the real cl/link, writes x64\Debug, .tlog, .log, .recipe, .vs
 vslab run                         # runs the exe like Ctrl+F5 (working folder = project folder, "Press any key")
 vslab zip                         # LabPointers_WilsonJ_sol.zip next to the folder, same layout as Visual Studio's zip
+vslab zip --clean --flat          # no .vs/x64/Debug folders, no top folder: short paths (see Zip path length)
 vslab check REF.zip MY.zip        # compare with a reference zip, file by file
 vslab seed REAL.zip              # optional, once: use a Visual Studio made zip to fill Browse.VC.db rows for Microsoft headers
 vslab vscode                      # VS Code tasks, F5 debug with g++, extension list (left out of the zip)
@@ -67,6 +68,25 @@ run task, zip task, and a launch configuration that builds a **native g++ debug 
 breakpoints and step through the code (install the "C/C++" extension by Microsoft). The native binary is only for
 stepping through logic; the graded program is the MSVC build. Behaviour differences between g++ and MSVC are possible
 (for example `#include "date.h"` for a file named `Date.h` works on Windows and Wine but fails with g++).
+
+### Zip path length (Windows 260 character limit)
+
+Windows stops at 259 characters per path. Extract All puts the zip into a folder named after it, so a zip with a top folder gets that name
+twice, and the build creates deep files such as `x64\Debug\<Name[:8]>.<guid8>.tlog\<Name>.lastbuildstate`. A grader who extracts into a long
+folder can then get `MSB3501 ... Could not find a part of the path`. After writing the zip, `vslab zip` computes the longest path as it would be
+after Extract All (an assumed 150 character target folder, `--base-len N` changes it), including the files a build creates even if they are not
+in the zip, and warns at 241 characters or more (error range from 260). Example:
+
+```
+vslab: WARNING: the longest path is 264 characters, but Windows stops at 259 (MAX_PATH). Building the unzipped lab can fail with MSB3501 / "Could not find a part of the path".
+  longest: ...\LabPolyMorphOp_WilsonJ_sol\LabPolyMorphOp_WilsonJ_sol\LabPolyMorphOp_WilsonJ\x64\Debug\LabPolyM.af636384.tlog\LabPolyMorphOp_WilsonJ.lastbuildstate
+  ...
+```
+
+The default zip is unchanged (same as Visual Studio's). Two options make it shorter: `--clean` leaves out `.vs`, `x64`, `Debug`, `Release`, `ARM64`
+(in the solution and project folder; `.vcxproj.user` stays), `--flat` writes the entries relative to the solution folder (the `.slnx` at the root, no top
+folder). `vslab zip --clean --flat` is the safe submission option. Assumption: the `.tlog` folder name is cut to 8 characters plus 8 GUID characters
+when the project name is longer than 16 characters (seen in a real Visual Studio 18 zip), otherwise it is `<Name>.tlog`.
 
 ### Zip checking
 

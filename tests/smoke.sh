@@ -23,4 +23,5 @@ mkdir .vscode; echo '{}' > .vscode/tasks.json
 unzip -l ../a.zip | grep -q '\.vs/' && ! unzip -l ../a.zip | grep -q vscode
 "$V" check ../a.zip ../a.zip | tail -1 | grep -q '0 missing'
 python3 "$(dirname "$V")/../tests/test_vcdb.py" >/dev/null 2>&1 || { echo "test_vcdb.py failed" >&2; exit 1; }
+python3 "$(dirname "$V")/../tests/test_zip.py" >/dev/null 2>&1 || { echo "test_zip.py failed" >&2; exit 1; }
 echo "smoke OK"
