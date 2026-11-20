@@ -15,6 +15,7 @@
 #      redistributes any Microsoft binary.
 #   4. installs MSVC + Windows SDK (+ MSBuild and the C++ MSBuild targets unless --no-msbuild).
 #   5. links vslab into ~/.local/bin and writes DIR/env.sh.
+#   Also: makes DIR/venv with libclang (no root needed) for the symbols in Browse.VC.db; a failure there only warns.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -53,7 +54,7 @@ if [ ${#missing[@]} -gt 0 ]; then
   CAN_SUDO=no; [ "$(id -u)" = 0 ] && CAN_SUDO=yes
   sudo -n true 2>/dev/null && CAN_SUDO=yes
   if [ "$USERSPACE" = auto ]; then [ "$CAN_SUDO" = yes ] && USERSPACE=no || USERSPACE=yes; fi
-  APT_PKGS="wine64 libwine wine msitools python3 unzip git curl ca-certificates"
+  APT_PKGS="wine64 libwine wine msitools python3 python3-venv unzip git curl ca-certificates"
   if [ "$USERSPACE" = no ]; then
     echo "Run this once (it needs sudo), then run ./install.sh again:"
     echo "    sudo apt update && sudo apt install -y $APT_PKGS"
@@ -114,6 +115,36 @@ ln -sf "$HERE/bin/vslab" "$HOME/.local/bin/vslab"
 grep -q "VSLAB_ROOT" "$HOME/.profile" 2>/dev/null || echo "export VSLAB_ROOT=\"$ROOT\"" >> "$HOME/.profile"
 export VSLAB_ROOT="$ROOT"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "note: add \$HOME/.local/bin to your PATH";; esac
+
+# ---------------------------------------------------------------- libclang venv (Browse.VC.db symbols)
+# $ROOT/venv with libclang, used by `vslab build`/`cache` to index your project's own symbols. No root needed: it is a plain venv.
+# If this step fails the rest still works, Browse.VC.db is then schema only, and `vslab doctor` says why.
+say "libclang venv ($ROOT/venv)"
+venv_ok() { [ -x "$ROOT/venv/bin/python" ] && "$ROOT/venv/bin/python" -c 'import clang.cindex' >/dev/null 2>&1; }
+if venv_ok; then
+  echo "libclang venv already in place"
+else
+  rm -rf "$ROOT/venv"
+  if python3 -m venv "$ROOT/venv" >/dev/null 2>&1; then
+    :
+  else
+    # no ensurepip (Debian/Ubuntu without python3-venv and no sudo): venv without pip, then bootstrap pip from pypa
+    echo "python3 -m venv could not install pip; trying without pip (sudo apt install python3-venv avoids this)"
+    rm -rf "$ROOT/venv"
+    if python3 -m venv --without-pip "$ROOT/venv" >/dev/null 2>&1; then
+      GP=$ROOT/get-pip.py
+      if command -v curl >/dev/null 2>&1; then curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$GP" || true
+      elif command -v wget >/dev/null 2>&1; then wget -q https://bootstrap.pypa.io/get-pip.py -O "$GP" || true; fi
+      [ -s "$GP" ] && "$ROOT/venv/bin/python" "$GP" >/dev/null 2>&1 || true
+      rm -f "$GP"
+    fi
+  fi
+  if [ -x "$ROOT/venv/bin/pip" ] || "$ROOT/venv/bin/python" -m pip --version >/dev/null 2>&1; then
+    "$ROOT/venv/bin/python" -m pip install --quiet libclang || true
+  fi
+  if venv_ok; then echo "libclang venv ready"
+  else echo "WARNING: could not set up the libclang venv. Browse.VC.db will be schema only. Fix: python3 -m venv $ROOT/venv && $ROOT/venv/bin/pip install libclang"; fi
+fi
 
 [ "$DO_MSVC" = yes ] || { echo "skipping MSVC (--no-msvc)"; exit 0; }
 

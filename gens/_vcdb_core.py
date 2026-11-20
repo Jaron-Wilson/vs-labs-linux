@@ -18,6 +18,8 @@ See NOTES.md for what is exact and what is approximate.
 import argparse, os, re, sqlite3, sys, time, glob, subprocess, collections
 import xml.etree.ElementTree as ET
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_REF = os.path.join(os.environ.get("VSLAB_ROOT", os.path.expanduser("~/.local/share/vslab")), "reference", "Browse.VC.db")
 _UNUSED_REF = (
@@ -48,14 +50,39 @@ def to_win(path_posix, proj_dir, win_proj_dir):
     return win_proj_dir.rstrip("\\") + "\\" + rel.replace("/", "\\")
 
 
-def create_schema(con, ddl_file):
-    """DDL copied verbatim from the reference DBs (sqlite_master order)."""
-    with open(os.path.join(HERE, ddl_file), encoding="utf-8") as f:
-        stmts = [s.strip("\n") for s in f.read().split("\n;;\n") if s.strip()]
-    for sql in stmts:
-        if re.match(r"CREATE TABLE '\w+_(?:data|idx|docsize|config)'", sql):
-            continue            # FTS5 shadow tables come with CREATE VIRTUAL TABLE
-        con.execute(sql)
+import _vcdb_schema as vschema
+create_schema = vschema.create_schema      # DDL copied verbatim from the reference DBs (sqlite_master order)
+
+
+_dest_cols = {}
+
+
+def put(con, table, row, default=None, mode="insert"):
+    """Insert a dict row into `table` by column NAME. Keys the destination lacks are dropped; destination columns the row lacks
+    take `default` (a dict) or NULL, so a seed from another Visual Studio release still loads."""
+    key = (id(con), table)
+    if key not in _dest_cols or _dest_cols[key][0] is not con:   # keep con alive in the cache so its id cannot be reused
+        _dest_cols[key] = (con, [r[1] for r in con.execute('pragma table_info("%s")' % table)])
+    cols = _dest_cols[key][1]
+    d = dict(default or {}); d.update(row)
+    con.execute('%s into "%s"(%s) values(%s)' % (mode, table, ",".join('"%s"' % c for c in cols), ",".join("?" * len(cols))),
+                [d.get(c) for c in cols])
+
+
+CODE_ITEM_COLS = ["id", "file_id", "parent_id", "kind", "attributes", "name", "type", "start_column", "start_line", "end_column",
+                  "end_line", "name_start_column", "name_start_line", "name_end_column", "name_end_line", "param_default_value",
+                  "param_default_value_start_column", "param_default_value_start_line", "param_default_value_end_column",
+                  "param_default_value_end_line", "param_number", "lower_name_hint"]
+FILE_COLS = ["id", "timestamp", "parsetime", "addtime", "difftime", "name", "leaf_name", "extension", "attributes", "parser_guid"]
+CF_COLS = ["config_id", "file_id", "attributes", "parse_timestamp", "include_path", "framework_include_path", "options"]
+
+
+def rowtuple(d, cols):
+    return tuple(d.get(c) for c in cols)
+
+
+def rowdict(cols, values):
+    return dict(zip(cols, values))
 
 
 # ------------------------------------------------------------ vcxproj model
@@ -105,6 +132,8 @@ class Ref:
     def __init__(self, path):
         self.con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
         self.q = lambda s, a=(): self.con.execute(s, a).fetchall()
+        self.layout = vschema.seed_layout(path)
+        self._cols = {}
         self.files = {r[0]: r for r in self.q("select id,name,attributes from files")}
         self.sys_ids = sorted(i for i, r in self.files.items()
                               if "\\MICROSOFT VISUAL STUDIO\\" in r[1] or "\\WINDOWS KITS\\" in r[1])
@@ -147,6 +176,19 @@ class Ref:
         self.sym_by_name = collections.defaultdict(list)
         for sid, name, kind, sk in self.q("select id,name,kind,symbol_kind from symbols"):
             self.sym_by_name[name].append((sid, kind, sk))
+
+    def cols(self, table):
+        """column names of a seed table or view, in the seed's own order"""
+        if table not in self._cols:
+            self._cols[table] = [r[1] for r in self.con.execute('pragma table_info("%s")' % table)]
+        return self._cols[table]
+
+    def rows(self, table, where="", args=()):
+        """rows of a seed table as dicts keyed by column NAME. Never read a seed positionally: the column order and
+        even the primary key differ between Visual Studio releases (template_args gained nesting_level, for one)."""
+        cur = self.con.execute('select * from "%s" %s' % (table, ("where " + where) if where else ""), args)
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, r)) for r in cur.fetchall()]
 
     def resolve_angle(self, name):
         return self.by_rel.get(name.upper().replace("/", "\\"))
@@ -923,6 +965,42 @@ def refs_json(lst):
     return "[" + ",".join("[%d,%d,%d,%d]" % t for t in lst) + "]"
 
 
+OWNED_KINDS = {0, 1, 2, 3}   # derived_of, base_override_of, override_of, direct_override_of: owned by the file that declares them
+
+
+def copy_relations(con, ref, sym_rows, sref_rows, ref_to_new, new_layout):
+    """Symbol relations of the seed's system symbols. The seed may keep them in one table (older layout, no file) or split in
+    symbol_rels_free / symbol_rels_owned (18.12). Read by name from whichever exists, write in the output's layout.
+    In Visual Studio 18.12 the kinds 0 to 3 are owned (they belong to the file that declares the derived class or the override),
+    kinds 4 to 8 are free."""
+    rels = ref.rows("symbol_relations")      # a table in the older layout, a view over free + owned in 18.12
+    owned_file = {}
+    if ref.layout == vschema.NEW:
+        for r in ref.rows("symbol_rels_owned"):
+            owned_file[(r["source_symbol_id"], r["target_symbol_id"], r["config_id"], r["kind"])] = r["file_id"]
+    else:
+        first_ref = {}
+        for r in sref_rows:        # owner file of an old row: the file where its source symbol is declared or defined
+            if r["decl_defn_refs"]:
+                first_ref.setdefault(r["symbol_id"], r["file_id"])
+    for r in rels:
+        if r["source_symbol_id"] not in sym_rows or r["target_symbol_id"] not in sym_rows:
+            continue
+        if not new_layout:
+            put(con, "symbol_relations", r)
+            continue
+        if r["kind"] in OWNED_KINDS:
+            f = owned_file.get((r["source_symbol_id"], r["target_symbol_id"], r["config_id"], r["kind"]))
+            if f is None and ref.layout != vschema.NEW:
+                f = first_ref.get(r["source_symbol_id"])
+            f = ref_to_new.get(f)
+            if f is None:
+                continue
+            put(con, "symbol_rels_owned", dict(r, file_id=f), mode="insert or ignore")
+        else:
+            put(con, "symbol_rels_free", r, mode="insert or ignore")
+
+
 def build(args):
     t_start = time.time()
     vcx = glob.glob(os.path.join(args.project_dir, "*.vcxproj"))
@@ -933,6 +1011,9 @@ def build(args):
     proj_win = win_sol + "\\" + proj.name
     ref = Ref(args.reference)
     rq = ref.q
+    layout = vschema.pick_layout(args.reference, tuple(int(x) for x in args.vs.split(".")[:2]) if args.vs else None)
+    new_layout = layout == vschema.NEW
+    print("Browse.VC.db layout:", layout, "(seed: %s)" % ref.layout)
     from clang import cindex as ci
     ex = Extractor(ci, proj, ref)
     for p in ex.pfiles:
@@ -964,10 +1045,10 @@ def build(args):
     con = sqlite3.connect(bpath)
     con.execute("pragma page_size=8192")      # Browse.VC.db uses 8192, Solution.VC.db 4096
     con.execute("pragma journal_mode=wal")
-    create_schema(con, "Browse.schema.sql")
+    create_schema(con, vschema.SCHEMA_FILES[layout])
     for t in ("parsers", "code_item_kinds"):
-        rows = rq("select * from %s" % t)
-        con.executemany("insert into %s values(%s)" % (t, ",".join("?" * len(rows[0]))), rows)
+        for r in ref.rows(t):
+            put(con, t, r)
     props = dict(rq("select name,value from properties"))
 
     # ---- file ids: modules 1025/1026, project files, then system headers
@@ -1035,14 +1116,14 @@ def build(args):
             frows.append((fid[p], 0, 0.0, 0.0, 0.0, w, leaf, ext, 64, "0" * 32))
             cfrows.append((CONFIG_ID, fid[p], 0, 0, None, None, None))
     for i in (1025, 1026):
-        frows.append(rq("select * from files where id=?", (i,))[0])
-        cfrows.append(rq("select * from config_files where file_id=?", (i,))[0])
+        frows.append(rowtuple(ref.rows("files", "id=?", (i,))[0], FILE_COLS))
+        cfrows.append(rowtuple(ref.rows("config_files", "file_id=?", (i,))[0], CF_COLS))
     for old, new in sys_new.items():
-        r = list(rq("select * from files where id=?", (old,))[0]); r[0] = new
-        frows.append(tuple(r))
-        c = list(rq("select * from config_files where file_id=?", (old,))[0]); c[1] = new
-        cfrows.append(tuple(c))
-    con.executemany("insert into files values(?,?,?,?,?,?,?,?,?,?)", frows)
+        r = ref.rows("files", "id=?", (old,))[0]; r["id"] = new
+        frows.append(rowtuple(r, FILE_COLS))
+        c = ref.rows("config_files", "file_id=?", (old,))[0]; c["file_id"] = new
+        cfrows.append(rowtuple(c, CF_COLS))
+    con.executemany("insert into files(%s) values(?,?,?,?,?,?,?,?,?,?)" % ",".join(FILE_COLS), frows)
 
     # ---- config + shared strings (ids 1..7)
     sd = SharedData(con, 8)
@@ -1059,23 +1140,22 @@ def build(args):
         elif i == 7:
             v = v.replace(refwin, proj_win + "\\")
         sd.add(v, fixed_id=i)
-    cfg_row = list(rq("select * from configs")[0])
-    cfg_row[1] = fnv1a_signed("%s|%s" % (proj_win.upper(), proj.config))
+    cfg_row = ref.rows("configs")[0]
+    cfg_row["hash"] = fnv1a_signed("%s|%s" % (proj_win.upper(), proj.config))
     con.execute("insert into projects values(?,?,?,?,?)",
                 (PROJECT_ID, (proj_win + "\\" + proj.name + ".vcxproj").upper(), proj_win.upper(), proj.guid, 0))
-    con.execute("insert into configs values(%s)" % ",".join("?" * len(cfg_row)), cfg_row)
-    con.executemany("insert into config_files values(?,?,?,?,?,?,?)", cfrows)
-    for r in rq("select * from hint_files"):
-        con.execute("insert into hint_files values(?,?,?)", r)
+    put(con, "configs", cfg_row)
+    con.executemany("insert into config_files(%s) values(?,?,?,?,?,?,?)" % ",".join(CF_COLS), cfrows)
+    for r in ref.rows("hint_files"):
+        put(con, "hint_files", r)
 
     # ---- code items: system rows copied (file ids remapped), project rows built
-    ci_rows = rq("select * from code_items where file_id in (%s)" %
-                 ",".join(map(str, set(sys_new) | {1025, 1026})))
+    ci_rows = ref.rows("code_items", "file_id in (%s)" % ",".join(map(str, set(sys_new) | {1025, 1026})))
     keep_items, max_item = set(), ROOT_PARENT
     for r in ci_rows:
-        r = list(r); r[1] = ref_to_new[r[1]]
-        keep_items.add(r[0]); max_item = max(max_item, r[0])
-        con.execute("insert into code_items values(%s)" % ",".join("?" * 22), r)
+        r["file_id"] = ref_to_new[r["file_id"]]
+        keep_items.add(r["id"]); max_item = max(max_item, r["id"])
+        put(con, "code_items", r)
     next_item = max_item + 1
     emitted = []
 
@@ -1085,7 +1165,7 @@ def build(args):
         next_item += 1
         d = it["default"]
         dsp = it["dsp"] or (None,) * 4
-        con.execute("insert into code_items values(%s)" % ",".join("?" * 22), (
+        con.execute("insert into code_items(%s) values(%s)" % (",".join(CODE_ITEM_COLS), ",".join("?" * 22)), (
             it["id"], fid[it["file"]], parent_id, it["kind"], it["attrs"], it["name"], it["type"],
             it["sc"], it["sl"], it["ec"], it["el"], it["nsc"], it["nsl"], it["nec"], it["nel"],
             d, dsp[0], dsp[1], dsp[2], dsp[3], it["pnum"], it["lower"][:4].lower()))
@@ -1098,28 +1178,29 @@ def build(args):
             emit(it, ROOT_PARENT)
     for it in emitted:
         if it.get("assoc_text"):
-            con.execute("insert into assoc_text values(?,?,?)", (it["id"],) + it["assoc_text"])
+            con.execute("insert into assoc_text(code_item_id,kind,text) values(?,?,?)", (it["id"],) + it["assoc_text"])
         if it.get("base_of"):
-            con.execute("insert into base_class_parents values(?,?)", (it["id"], it["base_of"]["id"]))
+            con.execute("insert into base_class_parents(base_code_item_id,parent_code_item_id) values(?,?)", (it["id"], it["base_of"]["id"]))
         par = it["parent"]
         if it["kind"] == 27 and par.get("kind") == 53:     # qualifier range of out of class definitions
             line = ex.lines[it["file"]][it["nsl"] - 1].decode("utf-8", "replace")
             m = re.search(r"(\w+)(?:<[^>]*>)?::$", line[:it["nsc"] - 1])
             if m:
-                con.execute("insert or ignore into assoc_spans values(?,?,?,?,?,?)",
+                con.execute("insert or ignore into assoc_spans(code_item_id,kind,start_column,start_line,end_column,end_line) values(?,?,?,?,?,?)",
                             (it["id"], 1, m.start(1) + 1, it["nsl"], it["nsc"] - 1, it["nsl"]))
     if keep_items:
         ks = ",".join(map(str, keep_items))
         for t in ("assoc_text", "assoc_spans"):
-            rows = [r for r in rq("select * from %s" % t) if r[0] in keep_items]
-            if rows:
-                con.executemany("insert into %s values(%s)" % (t, ",".join("?" * len(rows[0]))), rows)
-        con.executemany("insert into base_class_parents values(?,?)",
-                        [r for r in rq("select * from base_class_parents")
-                         if r[0] in keep_items and r[1] in keep_items])
-        for cid, cfgid, ff in rq("select * from file_map"):
-            if cid in keep_items and ff in ref_to_new:
-                con.execute("insert into file_map values(?,?,?)", (cid, cfgid, ref_to_new[ff]))
+            for r in ref.rows(t):
+                if r["code_item_id"] in keep_items:
+                    put(con, t, r)
+        for r in ref.rows("base_class_parents"):
+            if r["base_code_item_id"] in keep_items and r["parent_code_item_id"] in keep_items:
+                put(con, "base_class_parents", r)
+        for r in ref.rows("file_map"):
+            if r["code_item_id"] in keep_items and r["file_id"] in ref_to_new:
+                r["file_id"] = ref_to_new[r["file_id"]]
+                put(con, "file_map", r)
     for it in emitted:
         if it["kind"] == 39:
             kind, nm, resolved = it["include"]
@@ -1128,40 +1209,41 @@ def build(args):
                 rid = ref.resolve_angle(nm)
                 tgt = ref_to_new.get(rid)
             if tgt:
-                con.execute("insert or ignore into file_map values(?,?,?)", (it["id"], CONFIG_ID, tgt))
+                con.execute("insert or ignore into file_map(code_item_id,config_id,file_id) values(?,?,?)", (it["id"], CONFIG_ID, tgt))
 
     # ---- file_tu_map
     tu_rows = set()
     for tu, (pset, sset) in tu_info.items():
         tu_rows |= {(fid[p], fid[tu], CONFIG_ID) for p in pset}
         tu_rows |= {(ref_to_new[x], fid[tu], CONFIG_ID) for x in sset if x in ref_to_new}
-    con.executemany("insert into file_tu_map values(?,?,?)", sorted(tu_rows))
+    con.executemany("insert into file_tu_map(file_id,tu_file_id,config_id) values(?,?,?)", sorted(tu_rows))
 
     # ---- symbols
     sel = ",".join(map(str, set(sys_new) | {1025, 1026}))
-    sref_rows = rq("select * from symbol_refs where file_id in (%s)" % sel)
-    used = {r[0] for r in sref_rows}
+    sref_rows = ref.rows("symbol_refs", "file_id in (%s)" % sel)
+    used = {r["symbol_id"] for r in sref_rows}
     for k in ex.sym_order:
         if ex.syms[k]["ref_id"] is not None:
             used.add(ex.syms[k]["ref_id"])
-    sym_rows = {r[0]: r for r in rq("select * from symbols where id in (%s)" % ",".join(map(str, used or {0})))}
+    sym_rows = {r["id"]: r for r in ref.rows("symbols", "id in (%s)" % ",".join(map(str, used or {0})))}
     for r in sym_rows.values():
-        con.execute("insert into symbols values(?,?,?,?,?,?,?,?)", r)
-    tmpl_rows = [r for r in rq("select * from template_args where file_id in (%s)" % sel) if r[0] in sym_rows]
-    need = {v for r in sref_rows for v in (r[3], r[4]) if v} | {r[4] for r in tmpl_rows}
+        put(con, "symbols", r)
+    tmpl_rows = [r for r in ref.rows("template_args", "file_id in (%s)" % sel) if r["symbol_id"] in sym_rows]
+    need = {v for r in sref_rows for v in (r["decl_defn_refs"], r["usage_refs"]) if v} | {r["args"] for r in tmpl_rows}
     maxid = 7
-    for i, h, v in rq("select id,hash,value from shared_data where id in (%s)" % ",".join(map(str, need or {0}))):
-        con.execute("insert into shared_data values(?,?,?)", (i, h, v))
+    for r in ref.rows("shared_data", "id in (%s)" % ",".join(map(str, need or {0}))):
+        i, h, v = r["id"], r["hash"], r["value"]
+        con.execute("insert into shared_data(id,hash,value) values(?,?,?)", (i, h, v))
         maxid = max(maxid, i)
         sd.by.setdefault(v, i)
     sd.next = maxid + 1
     for r in sref_rows:
-        con.execute("insert into symbol_refs values(?,?,?,?,?)", (r[0], ref_to_new[r[1]], r[2], r[3], r[4]))
-    for r in rq("select * from symbol_relations"):
-        if r[0] in sym_rows and r[1] in sym_rows:
-            con.execute("insert into symbol_relations values(?,?,?,?)", r)
+        r["file_id"] = ref_to_new[r["file_id"]]
+        put(con, "symbol_refs", r)
+    copy_relations(con, ref, sym_rows, sref_rows, ref_to_new, new_layout)
     for r in tmpl_rows:
-        con.execute("insert into template_args values(?,?,?,?,?)", (r[0], r[1], ref_to_new[r[2]], r[3], r[4]))
+        r["file_id"] = ref_to_new[r["file_id"]]
+        put(con, "template_args", r, default={"nesting_level": 0})   # a seed from the older layout has no nesting level
     next_sym = (max(sym_rows) if sym_rows else 0) + 1
     new_sym = {}
     for k in ex.sym_order:
@@ -1171,7 +1253,7 @@ def build(args):
             continue
         new_sym[k] = next_sym
         kind, sem, sk, fl = s["info"]
-        con.execute("insert into symbols values(?,?,?,?,?,?,?,?)",
+        con.execute("insert into symbols(id,moniker_hash,name,declaration,kind,semantic_token_kind,symbol_kind,flags) values(?,?,?,?,?,?,?,?)",
                     (next_sym, fnv1a_signed("%s|%s" % (proj.name, k)), s["name"], None, kind, sem, sk, fl))
         next_sym += 1
     by_sf = {}
@@ -1184,7 +1266,7 @@ def build(args):
         uu = [t for t in lst if not t[0] & 3]
         a = sd.add(con.execute("select jsonb(?)", (refs_json(dd),)).fetchone()[0]) if dd else None
         b = sd.add(con.execute("select jsonb(?)", (refs_json(uu),)).fetchone()[0]) if uu else None
-        con.execute("insert or ignore into symbol_refs values(?,?,?,?,?)", (sid, f, CONFIG_ID, a, b))
+        con.execute("insert or ignore into symbol_refs(symbol_id,file_id,config_id,decl_defn_refs,usage_refs) values(?,?,?,?,?)", (sid, f, CONFIG_ID, a, b))
     # relations for project classes: derived_of / special_function_of
     sym_of_item = {}
     for it in emitted:
@@ -1196,7 +1278,7 @@ def build(args):
     for it in emitted:
         per_file[fid[it["file"]]].append((it["kind"], it["name"], it["type"]))
     for r in ci_rows:
-        per_file[ref_to_new[r[1]]].append((r[3], r[5], r[6]))
+        per_file[r["file_id"]].append((r["kind"], r["name"], r["type"]))   # file_id already remapped above
     for f in sorted(per_file):
         items = per_file[f]
         names = list(dict.fromkeys(n for k, n, t in items if k in FK and n))
@@ -1214,9 +1296,10 @@ def build(args):
                  ("path", browse_win + "Browse.VC.db"), ("enhanced_fts", "false"),
                  ("comment_tokens", props["comment_tokens"]), ("symbols_version", props["symbols_version"]),
                  ("symbols_locals", "true"), ("symbols_all_externals", "false"),
+                 *((("symbols_emit_declaration", "false"),) if new_layout else ()),
                  ("indexes_ready", "true"), ("safe_to_open", "true"),
                  ("code_items_cnt", str(n_items)), ("code_items_mod", str(n_items))):
-        con.execute("insert into properties values(?,?)", (n, v))
+        con.execute("insert into properties(name,value) values(?,?)", (n, v))
     con.commit()
     con.execute("pragma wal_checkpoint(truncate)")
     con.close()
@@ -1233,6 +1316,7 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--reference", default=DEFAULT_REF)
     ap.add_argument("--config", default="Debug|x64")
+    ap.add_argument("--vs", default=None, help="Visual Studio version, e.g. 18.12; picks the schema layout when the seed does not decide")
     ap.add_argument("--sln-name", default=None,
                     help="name of the .vs subfolder, e.g. Sol.slnx (default: parent folder of out-dir)")
     build(ap.parse_args())
