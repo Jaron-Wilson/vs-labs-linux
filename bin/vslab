@@ -773,6 +773,38 @@ def make_db(path, schema_file, rows=None):
     con.close()
 
 
+def loud(msg):
+    print(f"vslab: WARNING: {msg}", file=sys.stderr)
+
+
+def vs_version_guess():
+    """(major, minor) of the Visual Studio to imitate: VSLAB_VS, else from the installed MSVC toolset (14.52 is VS 18.12), else None."""
+    v = os.environ.get("VSLAB_VS")
+    if v:
+        return tuple(int(x) for x in v.split(".")[:2])
+    d = ROOT / "msvc/VC/Tools/MSVC"
+    vers = sorted(p.name for p in d.iterdir() if (p / "bin").is_dir()) if d.is_dir() else []
+    if not vers:
+        return None
+    pick = [x for x in vers if x.startswith(os.environ.get("VSLAB_MSVC", "14.52"))]
+    t = tuple(int(x) for x in (pick[-1] if pick else vers[-1]).split(".")[:2])
+    return (18, 12) if t >= (14, 52) else (18, 0)
+
+
+def make_browse_schema_only(path, vsv):
+    """Empty Browse.VC.db in the layout the seed has, else the one of the Visual Studio version."""
+    sch = load_gen("_vcdb_schema")
+    if path.exists():
+        path.unlink()
+    lay = sch.pick_layout(sch.seed_path(ROOT), vsv)
+    sch.create_browse_db(str(path), lay).close()
+    con = sqlite3.connect(path)
+    con.execute("pragma wal_checkpoint(truncate)")
+    con.close()
+    for suf in ("-wal", "-shm"):
+        Path(str(path) + suf).unlink(missing_ok=True)
+
+
 def load_gen(name):
     """optional generators dropped into gens/<name>.py with generate(lab, dest: Path) -> None"""
     p = REPO / "gens" / f"{name}.py"
@@ -810,14 +842,17 @@ def refresh_cache(lab, only=None):
     gs.generate(lab, v18 / "Solution.VC.db") if gs else make_db(v18 / "Solution.VC.db", "Solution.VC.db.sql")
     gb = load_gen("browse")
     done = False
-    if gb and gb.available(str(ROOT)):
+    vsv = vs_version_guess()
+    why = gb.problem(str(ROOT)) if gb else "gens/browse.py is missing"
+    if why is None:
         try:
-            gb.generate(lab, v18 / "Browse.VC.db")
+            gb.generate(lab, v18 / "Browse.VC.db", ".".join(map(str, vsv)) if vsv else None)
             done = True
         except Exception as e:
-            say("Browse.VC.db generator failed, using schema only:", str(e)[:300])
+            why = "the generator failed: " + str(e).strip().splitlines()[-1][:300]
     if not done:
-        make_db(v18 / "Browse.VC.db", "Browse.VC.db.sql")
+        loud(f"Browse.VC.db has the schema only (no symbols): {why}")
+        make_browse_schema_only(v18 / "Browse.VC.db", vsv)
     gu = load_gen("suo")
     gu.generate(lab, v18 / ".suo") if gu else (v18 / ".suo").write_bytes(b"")
     # vsidx: Visual Studio names it with a random GUID; keep an existing name, else make a new one
@@ -1211,6 +1246,14 @@ def cmd_doctor(a):
     print("MSBuild    :", "present" if (ROOT / "msvc/MSBuild").is_dir() else "not installed")
     for t in ("msiextract", "python3", "unzip"):
         print(f"{t:11}:", shutil.which(t, path=env.get("PATH")) or "MISSING")
+    sch = load_gen("_vcdb_schema")
+    ok, why = sch.venv_status(ROOT)
+    print("libclang   :", why if ok else "MISSING: " + why)
+    ok, why = sch.seed_status(ROOT)
+    print("seed       :", why if ok else "MISSING: " + why)
+    vsv = vs_version_guess()
+    print("Browse.VC.db:", "full generator ready" if sch.generator_problem(ROOT) is None else "schema only until the lines above are fixed",
+          f"(layout {sch.pick_layout(sch.seed_path(ROOT), vsv)})")
 
 
 def main():

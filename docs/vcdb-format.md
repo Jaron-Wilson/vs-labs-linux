@@ -9,7 +9,7 @@ Tools in this folder:
 
 - `gen_vcdb.py` builds both DBs for a project (needs `python3 -m venv .venv && .venv/bin/pip install libclang`; `gcc` is used to find the builtin clang headers).
 - `validate.py` compares a generated Browse.VC.db against the reference (output saved in `validation.txt`).
-- `Browse.schema.sql`, `Solution.schema.sql`: DDL dumped verbatim from the reference `sqlite_master` (tables, indexes, views, FTS5 virtual tables), statements separated by `\n;;\n`. `gen_vcdb.py` executes them as is, so the schema is byte identical (checked: `sqlite_master` rows equal for both DBs).
+- `Browse.schema.sql`, `Solution.schema.sql`: DDL dumped verbatim from the reference `sqlite_master` (tables, indexes, views, FTS5 virtual tables), statements separated by `\n;;\n`. `Browse.schema.sql` is the layout of older Visual Studio 18 builds; `Browse.schema.v18_12.sql` is the one Visual Studio 18.12 writes (symbol_rels_free / symbol_rels_owned, symbol_relations as a view, nesting_level in template_args, `*_ex` and `*_debug` views). `_vcdb_schema.py` picks the layout from the seed's schema, else from the Visual Studio version, and holds the venv and seed checks used by `vslab doctor`. Seed tables are read by column name, never by position. `gen_vcdb.py` executes them as is, so the schema is byte identical (checked: `sqlite_master` rows equal for both DBs).
 
 Example:
 
